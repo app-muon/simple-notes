@@ -1,0 +1,10 @@
+<resources>
+    <style name="Theme.SecureNotes" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowBackground">#121212</item>
+        <item name="android:windowSplashScreenBackground">#121212</item>
+        <item name="android:colorAccent">#9AD5B5</item>
+    </style>
+</resources>

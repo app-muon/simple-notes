@@ -1,0 +1,2 @@
+-keep class net.zetetic.database.sqlcipher.** { *; }
+-dontwarn com.google.errorprone.annotations.**
