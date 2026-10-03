@@ -268,7 +268,7 @@ class UiFlowTest {
     }
     @Test fun authenticationGateDoesNotRenderNotes() {
         compose.setContent { SecureNotesApp(vm, {}, {}, {}) }
-        compose.onNodeWithText("Secure Notes").assertIsDisplayed()
+        compose.onNodeWithText("Notes").assertIsDisplayed()
         compose.onNodeWithContentDescription("New note").assertDoesNotExist()
     }
     @Test fun createAutosaveReadingBackSearchAndConfirmedDelete() {

@@ -13,6 +13,8 @@ The 38 instrumentation tests passed across separate UI and storage runs. Reports
 
 The signed APK below has not been rebuilt for these source changes; its checksum still identifies the archived 1.0.1 artifact.
 
+After the display name and in-app text were changed to **Notes**, debug assembly, instrumentation-test compilation, and debug lint passed again. APK metadata confirms `application-label:'Notes'`. The unit and instrumentation suites above ran before this text-only rename and were not rerun for it.
+
 ## Archived signed build: 1.0.1 (2)
 
 The earlier deliverable is `dist/SecureNotes-1.0.1.apk`, version 1.0.1 (2), minimum Android 15 / API 35, targeting API 37. It contains ARM64 and x86_64 native libraries. Its in-place upgrade from 1.0.0 retained notes. That build's database schema and backup format remain version 1.

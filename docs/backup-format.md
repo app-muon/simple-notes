@@ -1,4 +1,4 @@
-# Secure Notes backup format, version 1
+# Notes backup format, version 1
 
 File extension: `.ssnb`. All integer header fields are signed big-endian Java `DataOutputStream` integers; only the positive values below are accepted.
 

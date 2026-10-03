@@ -101,7 +101,7 @@ class NotesApplication : Application() {
                     // disk), the notes still open so the user can free space; setup is retried on the next unlock.
                     try { repository.ensurePassphrase { Passphrase.generate(Passphrase.wordlist(this@NotesApplication)) } }
                     catch (e: CancellationException) { throw e }
-                    catch (_: Exception) { repository.issue.value = "Your recovery passphrase could not be set up, probably because storage is full. Free some space; Secure Notes will try again the next time you unlock." }
+                    catch (_: Exception) { repository.issue.value = "Your recovery passphrase could not be set up, probably because storage is full. Free some space; Notes will try again the next time you unlock." }
                     // Setup suspends for key derivation and storage. A lock can revoke this session while it runs.
                     if (expectedEpoch != sessionEpoch.get()) throw CancellationException("Session changed")
                     checkAccess()

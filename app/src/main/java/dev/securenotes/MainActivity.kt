@@ -107,7 +107,7 @@ class MainActivity : FragmentActivity() {
         catch (_: DeviceKeyUnavailableException) { app.endAuthentication(); model.keyUnavailable = true }
         catch (_: Exception) { app.endAuthentication(); model.error = "The device encryption key is unavailable. Your encrypted files have been preserved. Use your recovery passphrase or restore a backup." } }
     }
-    private fun unlockPrompt() = BiometricPrompt.PromptInfo.Builder().setTitle("Unlock Secure Notes")
+    private fun unlockPrompt() = BiometricPrompt.PromptInfo.Builder().setTitle("Unlock ${getString(R.string.app_name)}")
         .setSubtitle("Use your fingerprint, face, or device credential")
         .setAllowedAuthenticators(BIOMETRIC_STRONG or DEVICE_CREDENTIAL).build()
     /** Unwraps the root with the recovery passphrase, then binds it to a new device key behind a fresh authentication. */

@@ -220,7 +220,7 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     fun selectRestore(uri: Uri?) {
         restoreAfterUnlock = false
         if (uri == null) return
-        task("Checking backup…", "This file is not a supported Secure Notes backup, is incomplete, or could not be read.") {
+        task("Checking backup…", "This file is not a supported Notes backup, is incomplete, or could not be read.") {
             backups.checkHeader(uri); restoreUri = uri; passwordMode = "restore"
         }
     }

@@ -28,7 +28,7 @@ object BackupCodec {
     }
     private data class Header(val iterations: Int, val salt: ByteArray, val sealed: ByteArray, val prefix: ByteArray, val bytes: ByteArray)
     private fun header(data: DataInputStream): Header {
-        require(ByteArray(4).also(data::readFully).contentEquals(magic)) { "Not a Secure Notes backup" }
+        require(ByteArray(4).also(data::readFully).contentEquals(magic)) { "Not a Notes backup" }
         require(data.readInt() == VERSION) { "Unsupported backup version" }
         val iterations = data.readInt()
         require(iterations in Crypto.ITERATIONS..2_000_000) { "Unsupported KDF parameters" }

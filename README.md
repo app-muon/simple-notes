@@ -1,4 +1,4 @@
-# Secure Notes
+# Notes
 
 A native offline notes app for a Pixel 8 running **Android 15 or later**. The app has no Internet permission, accounts, analytics, or automatic backup. Its product source is [the specification](secure_simple_notes_android_spec.md), with the clarifications recorded below.
 

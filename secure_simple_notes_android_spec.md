@@ -998,7 +998,7 @@ Search result
 ``` text
 Other app
   -> Share
-  -> Secure Notes
+  -> Notes
   -> New note / Add to existing note
 ```
 

@@ -37,7 +37,7 @@ class AutoBackup(private val context: Context, private val repository: NotesRepo
     private class IncompleteWrite : Exception()
     val status = MutableStateFlow<Status?>(null)
     private val running = Mutex()
-    /** True when [uri] already holds a Secure Notes backup, which choosing it as the destination would overwrite. */
+    /** True when [uri] already holds a Notes backup, which choosing it as the destination would overwrite. */
     suspend fun containsBackup(uri: Uri): Boolean = withContext(Dispatchers.IO) {
         try { context.contentResolver.openInputStream(uri)?.use { BackupCodec.validateHeader(it); true } ?: false }
         catch (e: CancellationException) { throw e } catch (_: Exception) { false }
@@ -89,7 +89,7 @@ class AutoBackup(private val context: Context, private val repository: NotesRepo
             } catch (e: CancellationException) { throw e }
             catch (e: Exception) {
                 val message = when (e) {
-                    is LostPermission, is SecurityException -> "Secure Notes can no longer write to the backup file. Choose the backup location again."
+                    is LostPermission, is SecurityException -> "Notes can no longer write to the backup file. Choose the backup location again."
                     is IncompleteWrite -> "This backup location didn't replace the previous backup cleanly, so the file may not restore. Choose a different backup file or location."
                     else -> "The latest automatic backup could not be saved. Check the backup location and available storage."
                 }

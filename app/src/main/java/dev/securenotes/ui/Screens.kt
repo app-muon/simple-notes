@@ -44,6 +44,7 @@ import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.*
@@ -59,6 +60,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.securenotes.R
 import dev.securenotes.document.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -113,7 +115,7 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
     LaunchedEffect(Unit) { if (automatic && owner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) authenticate() }
     Column(Modifier.fillMaxSize().safeDrawingPadding().padding(32.dp), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
         Icon(Icons.Default.Lock, null, Modifier.size(48.dp), tint = MaterialTheme.colorScheme.primary)
-        Spacer(Modifier.height(24.dp)); Text("Secure Notes", style = MaterialTheme.typography.headlineLarge)
+        Spacer(Modifier.height(24.dp)); Text(stringResource(R.string.app_name), style = MaterialTheme.typography.headlineLarge)
         Spacer(Modifier.height(12.dp))
         when {
             !secure -> {
@@ -135,7 +137,7 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
             }
         }
     }
-    if (recovering) PassphraseDialog(vm.wordlist, "Recovery passphrase", "Enter the ${dev.securenotes.security.Passphrase.WORDS} words you saved when you first set up Secure Notes.", "Unlock",
+    if (recovering) PassphraseDialog(vm.wordlist, "Recovery passphrase", "Enter the ${dev.securenotes.security.Passphrase.WORDS} words you saved when you first set up Notes.", "Unlock",
         { recovering = false }) { recovering = false; recover(it) }
 }
 
@@ -174,20 +176,20 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
         }
     }
     when {
-        vm.restoreAfterUnlock -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Choose a Secure Notes backup file") }
+        vm.restoreAfterUnlock -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Choose a Notes backup file") }
         // Nothing else is reachable until the recovery passphrase has been confirmed.
         vm.setupWords != null -> PassphraseSetupScreen(vm, chooseRestore)
         else -> when (vm.screen) {
             Screen.LIST -> NotesList(vm)
             Screen.SEARCH -> SearchScreen(vm, back)
             Screen.NOTE -> NoteScreen(vm, back, attach, openFile)
-            Screen.SETTINGS -> SettingsScreen(vm, back, reveal, chooseRestore) { backupPicker.launch("SecureNotes.ssnb") }
+            Screen.SETTINGS -> SettingsScreen(vm, back, reveal, chooseRestore) { backupPicker.launch("Notes.ssnb") }
             Screen.IMAGE -> ImageViewer(vm, back)
         }
     }
     vm.revealedWords?.let { words -> RevealPassphraseDialog(words) { vm.revealedWords = null } }
     if (vm.replaceBackup != null) AlertDialog(onDismissRequest = { vm.replaceBackup = null }, title = { Text("Replace existing backup?") },
-        text = { Text("This file already contains a Secure Notes backup. If it came from another phone, it may be your only copy of those notes. Restore it instead, or replace it with a backup of the notes on this phone.") },
+        text = { Text("This file already contains a Notes backup. If it came from another phone, it may be your only copy of those notes. Restore it instead, or replace it with a backup of the notes on this phone.") },
         confirmButton = { TextButton(onClick = vm::restoreChosenBackup) { Text("Restore it") } },
         dismissButton = { Row {
             TextButton(onClick = { vm.replaceBackup = null }) { Text("Cancel") }
@@ -459,7 +461,7 @@ private fun annotatedLine(document: Document, start: Int, end: Int, match: dev.s
             Text("Automatic backup", style = MaterialTheme.typography.titleLarge)
             val location = status?.location
             if (location == null) {
-                Text("Choose a file, for example in Dropbox or Google Drive. Secure Notes keeps it updated with an encrypted copy of all notes and attachments whenever they change.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Choose a file, for example in Dropbox or Google Drive. Notes keeps it updated with an encrypted copy of all notes and attachments whenever they change.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 FilledTonalButton(onClick = chooseBackup, modifier = Modifier.fillMaxWidth()) { Text("Choose backup file") }
             } else {
                 Text(location, style = MaterialTheme.typography.titleMedium)
@@ -470,7 +472,7 @@ private fun annotatedLine(document: Document, start: Int, end: Int, match: dev.s
                 TextButton(onClick = vm::turnOffBackup, modifier = Modifier.fillMaxWidth()) { Text("Turn off automatic backup") }
             }
             OutlinedButton(onClick = restore, modifier = Modifier.fillMaxWidth()) { Text("Restore from backup") }
-            Spacer(Modifier.height(16.dp)); Text("Secure Notes · ${dev.securenotes.BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(16.dp)); Text("${stringResource(R.string.app_name)} · ${dev.securenotes.BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
