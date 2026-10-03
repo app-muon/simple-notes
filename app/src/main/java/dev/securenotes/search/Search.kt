@@ -4,8 +4,10 @@ import java.text.Normalizer
 import java.util.Locale
 
 data class Token(val term: String, val start: Int, val end: Int)
+enum class HitKind { TITLE, BODY, ATTACHMENT }
+/** [start]/[end] are offsets into the title or body text; attachment hits name the attachment. */
 data class SearchHit(
-    val noteId: String, val title: String, val blockId: String?, val attachmentId: String?,
+    val noteId: String, val title: String, val kind: HitKind, val attachmentId: String?,
     val start: Int, val end: Int, val snippet: String, val context: String?, val score: Int,
 )
 object SearchText {

@@ -13,12 +13,16 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
 import dev.securenotes.security.Crypto
+import dev.securenotes.security.Passphrase
 import kotlinx.serialization.encodeToString
 
 class NotesRepository(private val context: Context, private val checkAccess: () -> Unit) {
     val notes = MutableStateFlow<List<Note>>(emptyList())
-    val sort = MutableStateFlow(SortOrder.EDITED)
     val issue = MutableStateFlow<String?>(null)
+    /** Bumped after every committed content change; drives automatic backup. */
+    val changes = MutableStateFlow(0L)
+    /** Null while closed; false until the user has proven they saved the recovery passphrase. */
+    val passphraseConfirmed = MutableStateFlow<Boolean?>(null)
     val mutex = Mutex()
     private var root: ByteArray? = null
     private val saveScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -42,9 +46,9 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
         directory.mkdirs()
         val opened = Vault(context, directory, key, checkAccess)
         try {
+            opened.orderedNotes() // Capture the legacy display order before replaying pending edits.
             recoverEdits(opened)
-            notes.value = opened.dao.notes().map { it.decode() }
-            sort.value = opened.sort()
+            notes.value = opened.orderedNotes()
             if (!active.exists()) atomicWrite(active, id.toByteArray())
             cleanupGenerations(id)
             garbageCollect(opened)
@@ -70,7 +74,7 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
                 }
             } finally {
                 pending.clear(); current?.close(); vault = null
-                root?.fill(0); root = null; notes.value = emptyList()
+                root?.fill(0); root = null; notes.value = emptyList(); passphraseConfirmed.value = null
             }
         } }
     }
@@ -110,6 +114,30 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
     suspend fun <T> access(block: suspend (Vault) -> T): T = withContext(Dispatchers.IO) {
         mutex.withLock { checkAccess(); block(checkNotNull(vault)) }
     }
+    fun hasVault() = active.exists()
+    /** Unwraps the published generation's root with the recovery passphrase, without opening the vault. */
+    fun recoverRoot(passphrase: CharArray): ByteArray {
+        val id = android.util.AtomicFile(active).readFully().toString(Charsets.UTF_8).also { require(validId(it)) }
+        val wrapped = android.util.AtomicFile(File(File(generations, id), "recovery.key")).readFully()
+        return Passphrase.unwrap(wrapped, passphrase, Passphrase.recoveryAad(id))
+    }
+    /** Wraps this session's root under [passphrase] for [v]'s generation and stores the passphrase for later display. */
+    suspend fun setPassphrase(v: Vault, passphrase: String, confirmed: Boolean) {
+        val chars = passphrase.toCharArray()
+        try { atomicWrite(v.recoveryFile, Passphrase.wrap(checkNotNull(root), chars, Passphrase.recoveryAad(v.id))) } finally { chars.fill('\u0000') }
+        v.dao.putSecret(SecretRow("passphrase", passphrase.toByteArray(Charsets.UTF_8)))
+        if (confirmed) v.dao.putSecret(SecretRow("passphrase-confirmed", byteArrayOf(1))) else v.dao.deleteSecret("passphrase-confirmed")
+        if (v === vault) passphraseConfirmed.value = confirmed
+    }
+    /** Creates the recovery passphrase on first unlock; returns whether the user has confirmed saving it. */
+    suspend fun ensurePassphrase(generate: () -> String): Boolean = access { v ->
+        if (v.passphrase() == null || !v.recoveryFile.exists()) setPassphrase(v, v.passphrase() ?: generate(), false)
+        v.passphraseConfirmed().also { passphraseConfirmed.value = it }
+    }
+    suspend fun passphrase(): String = access { checkNotNull(it.passphrase()) }
+    suspend fun confirmPassphrase() = access { v ->
+        v.dao.putSecret(SecretRow("passphrase-confirmed", byteArrayOf(1))); passphraseConfirmed.value = true
+    }
     suspend fun save(note: Note, preserveEmpty: Boolean = false) = access { v -> saveSnapshot(v, note, preserveEmpty) }
     private suspend fun saveSnapshot(v: Vault, note: Note, preserveEmpty: Boolean) {
         note.document.validate()
@@ -117,20 +145,25 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
         if (existing != null && existing.updatedAt > note.updatedAt) return
         if (note.isEmpty && existing == null && !preserveEmpty) return
         v.database.withTransaction { saveIn(v, note) }
-        notes.value = notes.value.filterNot { it.id == note.id } + note
+        changes.value++
+        notes.value = if (notes.value.any { it.id == note.id }) notes.value.map { if (it.id == note.id) note else it }
+            else listOf(note) + notes.value
     }
     suspend fun saveIn(v: Vault, note: Note) {
+        if (v.dao.note(note.id) == null) {
+            val order = v.noteOrder() ?: v.orderedNotes().map(Note::id)
+            v.setNoteOrder(listOf(note.id) + order.filterNot { it == note.id })
+        }
         v.dao.put(NoteRow.of(note))
-        val attachments = note.document.blocks.mapNotNull { it.attachmentId }.toSet()
-        val sourceIds = note.document.blocks.map { it.id }.toSet() + "${note.id}:title"
+        val attachments = note.document.attachments.toSet()
+        val sourceIds = setOf("${note.id}:title", "${note.id}:body") + attachments.map { "${note.id}:file:$it" }
         v.dao.sources(note.id).filter { if (it.kind == "extracted") it.attachmentId !in attachments else it.id !in sourceIds }.forEach { removeSource(v, it.id) }
-        addSource(v, SourceRow("${note.id}:title", note.id, null, null, "title", note.title))
-        note.document.blocks.forEach { b ->
-            if (b.isAttachment) {
-                val a = v.dao.attachment(b.attachmentId!!) ?: error("Missing attachment")
-                require(a.noteId == note.id)
-                addSource(v, SourceRow(b.id, note.id, b.id, a.id, "filename", a.filename))
-            } else addSource(v, SourceRow(b.id, note.id, b.id, null, "body", b.text))
+        addSource(v, SourceRow("${note.id}:title", note.id, null, "title", note.title))
+        addSource(v, SourceRow("${note.id}:body", note.id, null, "body", note.document.text))
+        note.document.attachments.forEach { id ->
+            val a = v.dao.attachment(id) ?: error("Missing attachment")
+            require(a.noteId == note.id)
+            addSource(v, SourceRow("${note.id}:file:$id", note.id, a.id, "filename", a.filename))
         }
     }
     suspend fun addSource(v: Vault, source: SourceRow) {
@@ -141,21 +174,32 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
         }
     }
     private suspend fun removeSource(v: Vault, id: String) { v.dao.deletePostings(id); v.dao.deleteSource(id) }
-    suspend fun refresh(v: Vault) { notes.value = v.dao.notes().map { it.decode() }; sort.value = v.sort() }
-    suspend fun setSort(order: SortOrder) = access { it.setSort(order); sort.value = order }
+    suspend fun refresh(v: Vault) { notes.value = v.orderedNotes() }
+    suspend fun reorder(ids: List<String>) = access { v ->
+        val current = v.orderedNotes()
+        require(ids.size == current.size && ids.toSet() == current.map(Note::id).toSet())
+        v.database.withTransaction { v.setNoteOrder(ids) }
+        changes.value++
+        val byId = current.associateBy(Note::id)
+        notes.value = ids.map { byId.getValue(it) }
+    }
     suspend fun delete(id: String) = access { v ->
-        v.database.withTransaction { v.dao.sources(id).forEach { removeSource(v, it.id) }; v.dao.deleteNote(id) }
+        v.database.withTransaction {
+            v.dao.sources(id).forEach { removeSource(v, it.id) }; v.dao.deleteNote(id)
+            v.setNoteOrder(v.noteOrder().orEmpty().filterNot { it == id })
+        }
         v.dao.imports().filter { it.noteId == id }.forEach { v.dao.deleteImport(it.id) }
         v.dao.attachments().filter { it.noteId == id }.forEach { v.blob(it.id).delete(); v.dao.deleteAttachment(it.id) }
+        changes.value++
         refresh(v)
     }
     suspend fun collectGarbage(retain: Set<String> = emptySet()) = access { garbageCollect(it, retain) }
     private suspend fun garbageCollect(v: Vault, retain: Set<String> = emptySet()) {
-        val used = v.dao.notes().flatMap { it.decode().document.blocks.mapNotNull { b -> b.attachmentId } }.toSet() + retain
+        val used = v.dao.notes().flatMap { it.decode().document.attachments }.toSet() + retain
         v.dao.attachments().filter { it.id !in used }.forEach { a -> v.blob(a.id).delete(); v.dao.deleteAttachment(a.id) }
         v.blobs.listFiles()?.filter { it.name !in used }?.forEach { it.delete() }
     }
-    suspend fun import(note: Note, uri: Uri, mimeHint: String? = null, importId: String = newId(), blockId: String = newId()): Note = access { v ->
+    suspend fun import(note: Note, uri: Uri, mimeHint: String? = null, importId: String = newId()): Note = access { v ->
         v.dao.attachment(importId)?.let { return@access checkNotNull(v.dao.note(it.noteId)).decode() }
         require(uri.scheme == "content")
         check(uri.authority != "${context.packageName}.attachments")
@@ -164,7 +208,7 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
             if (c.moveToFirst()) filename = c.getString(0)?.take(512)?.ifBlank { "Attachment" } ?: filename
         }
         val mime = context.contentResolver.getType(uri) ?: mimeHint ?: "application/octet-stream"
-        val job = ImportRow(importId, note.id, uri.toString(), filename, mime, blockId)
+        val job = ImportRow(importId, note.id, uri.toString(), filename, mime)
         v.database.withTransaction { saveIn(v, note); v.dao.putImport(job) }
         try {
             completeImport(v, job)
@@ -182,10 +226,10 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
         val uri = Uri.parse(job.uri)
         val (size, hash) = context.contentResolver.openInputStream(uri)!!.use { v.write(job.id, it) { operation.ensureActive() } }
         val attachment = AttachmentRow(job.id, note.id, job.filename, job.mime, size, hash)
-        val block = Block(id = job.blockId, type = if (job.mime.startsWith("image/")) BlockType.IMAGE else BlockType.FILE, attachmentId = job.id)
-        val result = note.copy(document = note.document.copy(blocks = note.document.blocks + block), updatedAt = maxOf(System.currentTimeMillis(), note.updatedAt + 1))
+        val result = note.copy(document = note.document.copy(attachments = note.document.attachments.filterNot { it == job.id } + job.id), updatedAt = maxOf(System.currentTimeMillis(), note.updatedAt + 1))
         v.database.withTransaction { v.dao.putAttachment(attachment); saveIn(v, result); v.dao.deleteImport(job.id) }
         runCatching { context.contentResolver.releasePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+        changes.value++
         refresh(v); return result
     }
     suspend fun attachments(): Map<String, AttachmentRow> = access { it.dao.attachments().associateBy { a -> a.id } }
@@ -221,11 +265,12 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
                 if (base == 0) continue
                 val source = sources.getOrPut(posting.sourceId) { v.dao.source(posting.sourceId) } ?: continue
                 val note = noteMap[source.noteId] ?: continue
-                val blockId = if (source.kind == "extracted") note.document.blocks.firstOrNull { it.attachmentId == source.attachmentId }?.id ?: continue else source.blockId
+                val kind = when (source.kind) { "title" -> HitKind.TITLE; "body" -> HitKind.BODY; else -> HitKind.ATTACHMENT }
+                if (kind == HitKind.ATTACHMENT && source.attachmentId !in note.document.attachments) continue
                 val score = base * 10 + when (source.kind) { "title" -> 4; "body" -> 3; "filename" -> 2; else -> 1 }
                 matches.getOrPut(note.id) { mutableSetOf() }.add(term)
                 if ((best[note.id]?.score ?: 0) < score) {
-                    best[note.id] = SearchHit(note.id, note.displayTitle, blockId, source.attachmentId,
+                    best[note.id] = SearchHit(note.id, note.displayTitle, kind, source.attachmentId,
                         posting.start + source.offset, posting.end + source.offset,
                         SearchText.snippet(source.text, posting.start, posting.end),
                         source.attachmentId?.let { v.dao.attachment(it)?.filename }, score)
@@ -275,7 +320,7 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
             checkAccess()
             v.database.withTransaction {
                 SearchText.chunks(text).forEachIndexed { index, chunk ->
-                    addSource(v, SourceRow("${a.id}:${a.nextPage}:$index", a.noteId, null, a.id, "extracted", chunk))
+                    addSource(v, SourceRow("${a.id}:${a.nextPage}:$index", a.noteId, a.id, "extracted", chunk))
                 }
                 v.dao.putAttachment(a.copy(indexed = done, nextPage = nextPosition))
             }
@@ -294,14 +339,14 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
     suspend fun activate(staged: Vault) {
         checkAccess()
         val old = vault
-        val restoredNotes = staged.dao.notes().map { it.decode() }
-        val restoredSort = staged.sort()
+        val restoredNotes = staged.orderedNotes()
         // SQLite checkpoint before publishing the generation pointer.
         staged.database.openHelper.writableDatabase.query("PRAGMA wal_checkpoint(FULL)").close()
         checkAccess(); currentCoroutineContext().ensureActive()
         atomicWrite(active, staged.id.toByteArray())
         // After publication, cleanup failure must never make the staged vault deletable.
-        vault = staged; notes.value = restoredNotes; sort.value = restoredSort
+        vault = staged; notes.value = restoredNotes
+        passphraseConfirmed.value = runCatching { staged.passphraseConfirmed() }.getOrDefault(false); changes.value++
         pending.clear(); encryptedRecovery = null
         runCatching { old?.close() }
         runCatching { cleanupGenerations(staged.id) }

@@ -6,14 +6,13 @@ import androidx.compose.runtime.*
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.securenotes.NotesApplication
-import dev.securenotes.backup.BackupService
 import dev.securenotes.document.*
 import dev.securenotes.search.SearchHit
+import dev.securenotes.security.Passphrase
 import dev.securenotes.storage.AttachmentRow
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import java.io.File
 
 enum class Screen { LIST, NOTE, SEARCH, SETTINGS, IMAGE }
 data class SharedContent(val text: String?, val uris: List<Uri>, val mime: String?)
@@ -21,14 +20,27 @@ data class SharedContent(val text: String?, val uris: List<Uri>, val mime: Strin
 class NotesViewModel(application: Application) : AndroidViewModel(application) {
     val app = application as NotesApplication
     val repository = app.repository
-    val backups = BackupService(app, repository, app::checkAccess)
+    val backups = app.backups
+    val wordlist: Set<String> by lazy { Passphrase.wordlist(app).toSet() }
+    /** The device key is gone but the vault remains; only the recovery passphrase can open it. */
+    var keyUnavailable by mutableStateOf(false)
+    /** First run on a new phone: open the restore picker as soon as the new empty store is unlocked. */
+    var restoreAfterUnlock by mutableStateOf(false)
+    /** Words shown during first-run setup until the user proves they saved them. */
+    var setupWords by mutableStateOf<List<String>?>(null)
+    /** Words shown after a fresh authentication from Settings. */
+    var revealedWords by mutableStateOf<List<String>?>(null)
+    /** A "Show recovery passphrase" prompt is running. Kept here, not in the activity, so it survives rotation. */
+    var revealing = false
+    /** A chosen destination that already holds a backup (perhaps the only copy from another phone): overwriting it needs confirmation. */
+    var replaceBackup by mutableStateOf<Uri?>(null)
     var screen by mutableStateOf(Screen.LIST)
     var note by mutableStateOf<Note?>(null)
     var editing by mutableStateOf(false)
     var newDraft by mutableStateOf(false)
     var focusTitle by mutableStateOf(false)
-    var focusedBlock by mutableStateOf<String?>(null)
-    var focusOffset by mutableStateOf<Int?>(null)
+    /** A pending request to focus the body editor at this offset. */
+    var bodyFocus by mutableStateOf<Int?>(null)
     var attachments by mutableStateOf<Map<String, AttachmentRow>>(emptyMap())
     var query by mutableStateOf("")
     var results by mutableStateOf<List<SearchHit>>(emptyList())
@@ -36,7 +48,6 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     var imageId by mutableStateOf<String?>(null)
     var error by mutableStateOf<String?>(null)
     var busy by mutableStateOf<String?>(null)
-    var backupFile by mutableStateOf<File?>(null)
     var restoreUri by mutableStateOf<Uri?>(null)
     var restoreCount by mutableStateOf<Int?>(null)
     var passwordMode by mutableStateOf<String?>(null)
@@ -52,6 +63,8 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     private var activeOperation: Job? = null
     private val operations = mutableSetOf<Job>()
     private val operationMutex = Mutex()
+    // viewModelScope runs on Main.immediate, so these collectors start inside the constructor. Any property they
+    // touch must be declared above this block; properties below it are not initialized yet.
     init {
         viewModelScope.launch { repository.issue.collect { issue -> if (issue != null) { error = issue; repository.issue.value = null } } }
         viewModelScope.launch { repository.notes.collect {
@@ -62,8 +75,12 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
                 operations.toList().forEach { it.cancel() }; searchJob?.cancel(); backups.discard()
                 note = null; attachments = emptyMap(); results = emptyList(); query = ""; hit = null
                 history.clear(); historyRevision++; screen = Screen.LIST; editing = false
-                busy = null; passwordMode = null; restoreCount = null
-            } else reloadAttachments()
+                busy = null; passwordMode = null; restoreCount = null; setupWords = null; revealedWords = null; replaceBackup = null
+            } else { keyUnavailable = false; reloadAttachments() }
+        } }
+        viewModelScope.launch { repository.passphraseConfirmed.collect { confirmed ->
+            setupWords = null
+            if (confirmed == false) runCatching { setupWords = repository.passphrase().split(' ') }
         } }
     }
     fun task(message: String?, failure: String, action: suspend () -> Unit) {
@@ -81,76 +98,42 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     fun cancelOperation() { activeOperation?.cancel(); busy = null }
     suspend fun reloadAttachments() { attachments = repository.attachments() }
     fun create() {
-        note = Note(); newDraft = true; editing = true; focusTitle = true; focusedBlock = null; focusOffset = null
+        note = Note(); newDraft = true; editing = true; focusTitle = true; bodyFocus = null
         history.clear(); historyRevision++; hit = null; screen = Screen.NOTE
     }
     fun open(value: Note, match: SearchHit? = null) {
-        note = value; newDraft = false; editing = false; focusTitle = false; focusedBlock = null
+        note = value; newDraft = false; editing = false; focusTitle = false; bodyFocus = null
         history.clear(); historyRevision++; hit = match; screen = Screen.NOTE
     }
-    fun change(value: Note, record: Boolean = true) {
+    /** Typing changes share one undo step until the user pauses; other changes are separate steps. */
+    fun change(value: Note, record: Boolean = true, typing: Boolean = false) {
         val old = note ?: return
         if (old == value) return
-        if (record && editing) history.record(old)
+        if (record && editing) history.record(old, typing)
         historyRevision++
         val updated = value.copy(updatedAt = maxOf(System.currentTimeMillis(), old.updatedAt + 1))
         try { repository.enqueue(updated, !newDraft); note = updated }
         catch (_: CancellationException) { app.lock() }
     }
-    fun block(value: Block) { note?.let { change(it.copy(document = it.document.copy(blocks = it.document.blocks.map { b -> if (b.id == value.id) value else b }))) } }
-    fun format(type: BlockType) {
+    fun editBody(document: Document, typing: Boolean) { note?.let { change(it.copy(document = document), typing = typing) } }
+    fun setChecked(line: Int, checked: Boolean) { note?.let { change(it.copy(document = DocumentEdits.setChecked(it.document, line, checked))) } }
+    fun moveAttachment(id: String, delta: Int) {
         val n = note ?: return
-        val id = focusedBlock ?: n.document.blocks.firstOrNull { !it.isAttachment }?.id
-        if (id == null) addText(type) else n.document.blocks.firstOrNull { it.id == id }?.let { block(it.copy(type = type)); focusTitle = false; focusedBlock = id }
+        val list = n.document.attachments
+        val index = list.indexOf(id); val target = index + delta
+        if (index < 0 || target !in list.indices) return
+        change(n.copy(document = n.document.copy(attachments = list.toMutableList().apply { add(target, removeAt(index)) })))
     }
-    fun addText(type: BlockType = BlockType.PARAGRAPH) {
-        val n = note ?: return
-        val block = Block(type = type)
-        change(n.copy(document = n.document.copy(blocks = n.document.blocks + block)))
-        focusedBlock = block.id; focusTitle = false; focusOffset = 0
-    }
-    fun split(id: String, text: String, bold: List<BoldSpan>) {
-        val n = note ?: return
-        val index = n.document.blocks.indexOfFirst { it.id == id }
-        if (index < 0) return
-        val old = n.document.blocks[index]
-        val pieces = text.split('\n')
-        if (pieces.size == 1) { block(old.copy(text = text, bold = bold)); return }
-        var offset = 0
-        val replacement = pieces.mapIndexed { i, piece ->
-            val spans = bold.mapNotNull { s ->
-                val start = maxOf(s.start, offset) - offset; val end = minOf(s.end, offset + piece.length) - offset
-                if (end > start) BoldSpan(start, end) else null
-            }
-            offset += piece.length + 1
-            old.copy(id = if (i == 0) id else newId(), text = piece, bold = spans,
-                type = if (i > 0 && (old.type in listOf(BlockType.HEADING1, BlockType.HEADING2) || (old.text.isEmpty() && piece.isEmpty()))) BlockType.PARAGRAPH else old.type,
-                checked = if (i == 0) old.checked else false)
+    fun removeAttachment(id: String) { note?.let { n -> change(n.copy(document = n.document.copy(attachments = n.document.attachments - id))) } }
+    fun reorderNotes(ids: List<String>, finished: () -> Unit = {}) {
+        task(null, "The note order could not be saved.") {
+            try { repository.reorder(ids) } finally { finished() }
         }
-        change(n.copy(document = n.document.copy(blocks = n.document.blocks.toMutableList().apply { removeAt(index); addAll(index, replacement) })))
-        focusedBlock = replacement.last().id; focusOffset = 0
     }
-    fun joinPrevious(id: String) {
-        val n = note ?: return
-        val index = n.document.blocks.indexOfFirst { it.id == id }
-        if (index <= 0) return
-        val previous = n.document.blocks[index - 1]; val current = n.document.blocks[index]
-        if (previous.isAttachment || current.isAttachment) return
-        val merged = previous.copy(text = previous.text + current.text, bold = previous.bold + current.bold.map { BoldSpan(it.start + previous.text.length, it.end + previous.text.length) })
-        change(n.copy(document = n.document.copy(blocks = n.document.blocks.toMutableList().apply { set(index - 1, merged); removeAt(index) })))
-        focusedBlock = previous.id; focusOffset = previous.text.length
-    }
-    fun move(id: String, delta: Int) {
-        val n = note ?: return
-        val index = n.document.blocks.indexOfFirst { it.id == id }; val target = index + delta
-        if (index < 0 || target !in n.document.blocks.indices) return
-        val blocks = n.document.blocks.toMutableList().apply { add(target, removeAt(index)) }
-        change(n.copy(document = n.document.copy(blocks = blocks)))
-    }
-    fun removeBlock(id: String) { note?.let { n -> change(n.copy(document = n.document.copy(blocks = n.document.blocks.filter { it.id != id }))) } }
     fun undo() { note?.let { n -> history.undo(n)?.let { change(it, false) } } }
     fun redo() { note?.let { n -> history.redo(n)?.let { change(it, false) } } }
-    fun enterEditing(id: String? = null) { editing = true; focusedBlock = id; focusTitle = id == null; focusOffset = null }
+    /** Enters editing with the cursor in the title, or in the body at [bodyOffset]. */
+    fun enterEditing(bodyOffset: Int? = null) { editing = true; focusTitle = bodyOffset == null; bodyFocus = bodyOffset }
     suspend fun flush() = repository.flush()
     fun back() {
         if (screen == Screen.IMAGE) { imageId = null; screen = Screen.NOTE; return }
@@ -160,7 +143,7 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
             val discard = newDraft && note?.isEmpty == true
             if (discard) note?.let { repository.delete(it.id) }
             endSession()
-            if (editing && !discard) { editing = false; focusTitle = false; focusedBlock = null }
+            if (editing && !discard) { editing = false; focusTitle = false; bodyFocus = null }
             else { screen = Screen.LIST; note = null }
         }
     }
@@ -222,43 +205,44 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
         if (destination == null) create() else { open(destination); editing = true }
         incoming.text?.takeIf { it.isNotBlank() }?.let { text ->
             val n = note!!
-            val blocks = if (n.document.blocks.size == 1 && n.document.blocks.first().text.isEmpty() && !n.document.blocks.first().isAttachment)
-                listOf(n.document.blocks.first().copy(text = text)) else n.document.blocks + Block(text = text)
-            change(n.copy(document = n.document.copy(blocks = blocks)))
+            change(n.copy(document = DocumentEdits.appendText(n.document, text)))
         }
         if (incoming.uris.isNotEmpty()) import(incoming.uris, incoming.mime)
     }
+    /** The passphrase that encrypted the selected backup; it becomes this store's recovery passphrase. */
     fun submitPassword(password: CharArray) {
-        val mode = passwordMode; passwordMode = null
-        task(if (mode == "restore") "Validating backup…" else "Preparing backup…", if (mode == "restore") "The backup could not be restored. Check the password, file integrity, version, and available storage." else "The backup operation failed. Check the password and available storage.") {
-            try {
-                when (mode) {
-                    "configure" -> backups.configure(password)
-                    "configure-backup" -> { flush(); backups.configure(password); backupFile = backups.create(password, ::progress) }
-                    "backup" -> { flush(); backupFile = backups.create(password, ::progress) }
-                    "restore" -> restoreCount = backups.stage(checkNotNull(restoreUri), password, ::progress)
-                }
-            } finally { password.fill('\u0000') }
+        passwordMode = null
+        task("Validating backup…", "The backup could not be restored. Check the passphrase, file integrity, version, and available storage.") {
+            try { restoreCount = backups.stage(checkNotNull(restoreUri), password, ::progress) } finally { password.fill('\u0000') }
         }
         operation?.invokeOnCompletion { password.fill('\u0000') }
     }
     fun selectRestore(uri: Uri?) {
+        restoreAfterUnlock = false
         if (uri == null) return
         task("Checking backup…", "This file is not a supported Secure Notes backup, is incomplete, or could not be read.") {
             backups.checkHeader(uri); restoreUri = uri; passwordMode = "restore"
         }
     }
-    fun requestBackup() { task("Checking backup settings…", "Backup settings could not be read.") { passwordMode = if (backups.configured()) "backup" else "configure-backup" } }
-    fun exportBackup(uri: Uri?) {
-        val file = backupFile ?: return
-        backupFile = null
-        if (uri == null) { file.delete(); return }
-        task("Writing encrypted backup…", "The backup could not be written to that location.") {
-            try { withContext(Dispatchers.IO) { val operationContext = currentCoroutineContext(); app.contentResolver.openOutputStream(uri, "wt")!!.use { out -> file.inputStream().use { backups.copyChecked(it, out) { operationContext.ensureActive() } } } } }
-            catch (e: Exception) { runCatching { android.provider.DocumentsContract.deleteDocument(app.contentResolver, uri) }; throw e }
-            finally { file.delete() }
+    fun confirmPassphrase() { task(null, "The confirmation could not be saved.") { repository.confirmPassphrase() } }
+    /** Called by the activity only after a fresh vault-key authentication. */
+    fun revealPassphrase() { task(null, "The recovery passphrase could not be read.") { revealedWords = repository.passphrase().split(' ') } }
+    private val unusableLocation = "That location can't be used for automatic backups. Choose a file in another location, for example in Files or Dropbox."
+    fun chooseBackup(uri: Uri?) {
+        if (uri == null) return
+        task("Checking backup file…", unusableLocation) {
+            if (app.autoBackup.containsBackup(uri)) replaceBackup = uri
+            else { flush(); app.autoBackup.choose(uri) }
         }
     }
+    fun confirmReplaceBackup() {
+        val uri = replaceBackup ?: return
+        replaceBackup = null
+        task("Saving encrypted backup…", unusableLocation) { flush(); app.autoBackup.choose(uri) }
+    }
+    fun restoreChosenBackup() { val uri = replaceBackup ?: return; replaceBackup = null; selectRestore(uri) }
+    fun backupNow() { task("Saving encrypted backup…", "The backup could not be saved.") { flush(); app.autoBackup.run(force = true, progress = ::progress) } }
+    fun turnOffBackup() { task(null, "Automatic backup settings could not be saved.") { app.autoBackup.turnOff() } }
     fun restore() {
         restoreCount = null
         task("Replacing notes…", "Restore could not be completed. Existing data has been retained where possible.") {

@@ -24,21 +24,25 @@ For a personal release, use `scripts/build-release.ps1`. It creates a dedicated 
 
 ## Using the app
 
-Configure a device PIN/password/pattern first. Unlock with a strong biometric or your device credential. Fresh processes require authentication. Ordinary app switching leaves the session unlocked; device locking ends it. Screenshots and normal Recent Apps previews remain available.
+Configure a device PIN/password/pattern first. Unlock with a strong biometric or your device credential. Fresh processes require authentication. Ordinary app switching leaves the session unlocked; device locking ends it. Screenshots remain available; Recent Apps previews are hidden, and screens showing the recovery passphrase block screenshots.
 
-The list shows titles only. New notes focus the title. Existing notes open in reading mode; tap text to edit. Formatting and the single attachment menu appear only while editing. Bold applies to selected text within one block. Enter creates a following block; Backspace at a block's start joins adjacent text. Lists are single-level. Checklist boxes work in reading mode. Back first leaves editing, then returns to the list. Empty new drafts are discarded; clearing an existing note does not silently delete it.
+The list shows titles only. New notes focus the title. Existing notes open in reading mode; tap text to edit. In reading mode Select All covers the whole note. While editing, the header turns green and shows ✓ Done. The body is one editor, so selection, copy, paste and the keyboard work across lines. The toolbar's bold, heading, bullet, numbered and checklist buttons apply to every selected line and show the current line's format. Enter continues a list, and Enter on an empty list item ends it; Backspace at the start of a list item first removes its marker. Pasted text arrives without outside formatting. Undo and redo step through typing pauses and formatting changes. Lists are single-level. Checkboxes can be tapped in both modes. Back or Done leaves editing, then Back returns to the list. Empty new drafts are discarded; clearing an existing note does not silently delete it.
 
-Images and files can be moved with a long-press drag or their Move up/Move down menu. Images open in a zoomable viewer. Files open through temporary read-only content URIs in another application. Text, links, images, and files can be shared **into** the app after choosing a destination. There is no note-export/share action.
+Images and files sit in the **Attachments** section below the text. While editing, [+] adds a photo, camera shot or file, and each item's menu moves it left/right or removes it. Images open in a zoomable viewer. Files open through temporary read-only content URIs in another application. Text, links, images, and files can be shared **into** the app after choosing a destination. There is no note-export/share action.
 
 Search includes titles, body text, filenames, and locally extracted text from PDFs and UTF-8 text files, including Markdown and CSV. Search ignores case/diacritics, supports prefixes, and tolerates one spelling error for words of four or more characters. Matching terms and postings are paged without an arbitrary result cutoff. Scanned/password-protected/unsupported documents remain searchable by filename. Search indexes are rebuilt locally after restore.
 
 ## Backup and recovery
 
-Set a separate backup password in Settings. Enter it for every backup; only an encrypted salted verifier is retained. An authenticated app session can change it without entering the old password. Changing it affects future backups, not existing files. Forgetting a backup's password makes that backup unrecoverable.
+On first run the app shows an 8-word **recovery passphrase** and asks for three of the words before continuing. Write it down. It opens your notes if this phone's unlock key is lost (for example after removing the screen lock), and it is the password for every backup. Settings → "View recovery passphrase" shows it again after a fresh biometric/device-credential check. The passphrase cannot be changed, and losing it makes backups unrecoverable.
 
-Backups are created as encrypted `.ssnb` files before Android's save picker opens. A cloud provider in that picker is controlled by Android/the selected provider; the app itself has no networking capability. Restore validates the entire backup, then asks before replacing all notes/settings. No safety backup or merge is performed. Keep manual backups outside this app's private storage.
+Settings → "Choose backup file" picks one file, for example in Dropbox or Google Drive through Android's file picker. Afterwards the app keeps that file overwritten with an encrypted backup of all notes and attachments: about a minute after changes stop, on unlock, and when leaving the app. The provider app does the uploading; this app has no network capability. Settings shows when the file was last saved and asks you to choose it again if the provider stops accepting writes.
 
-Uninstalling, clearing application storage, or losing/invalidation of the device Keystore key can make local data inaccessible. The app preserves inaccessible encrypted files and does not reset them silently. To recover from a manual backup after key loss, clear app storage through Android Settings, open the app again, authenticate, and restore. **Only do this when you have a usable backup.** Screenshots, clipboard contents, external viewers, and the camera application are outside the vault's control.
+On a new phone, install the app, choose "Restore from backup", pick the backup file, and enter the 8 words. Restore validates the entire backup, then asks before replacing all notes/settings. No safety backup or merge is performed. The restored notes keep the same recovery passphrase.
+
+Uninstalling or clearing application storage deletes the local vault; restore from your backup file afterwards. Screenshots, clipboard contents, external viewers, and the camera application are outside the vault's control.
+
+The passphrase wordlist is the [EFF large wordlist](https://www.eff.org/dice) by the Electronic Frontier Foundation, licensed under [CC BY 3.0 US](https://creativecommons.org/licenses/by/3.0/us/).
 
 See [security and lifecycle decisions](docs/security.md) and [the backup format](docs/backup-format.md).
 
@@ -59,8 +63,8 @@ Database schema version 1 is exported into `app/schemas`. There is no destructiv
 
 - Personal sideloading, English, approximately ten notes/attachments and 10 MB total. These are expected workload sizes, not enforced attachment limits.
 - Android 15+; authentication after every new process; a secure device lock is mandatory.
-- Password entry for every backup; PDF/plain-text extraction without OCR.
-- Native block editing with reading-mode checklist toggles.
+- Automatic backups encrypted under the generated recovery passphrase (no password entry); PDF/plain-text extraction without OCR.
+- One native editor for the note body with line formats; attachments in a separate section; checklist toggles in both modes.
 - Operations continue across ordinary app switching while the process is scheduled. Lock interrupts sensitive processing. Indexing/import checkpoints resume after authentication; backup/restore preparation restarts with password entry. Temporary third-party URI permissions may require selecting a source again.
 
 Autosave keeps the newest snapshot per note, waits for 300 ms of quiet, and starts a save within one second of continuous typing. Navigation and ordinary backgrounding flush edits. Lock immediately hides content and revokes access, then finishes accepted writes before closing storage. Failed lock-time writes use encrypted recovery records and produce a warning. Sudden process termination before a write completes can still lose uncommitted changes. There is no claim of forensic erasure of flash storage or perfect zeroization of JVM/framework memory.

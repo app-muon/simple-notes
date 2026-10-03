@@ -17,14 +17,14 @@ data class AttachmentRow(
     val size: Long, val sha256: String, val indexed: Boolean = false, val nextPage: Int = 0,
 )
 @Entity(tableName = "sources", indices = [Index("noteId"), Index("attachmentId")])
-data class SourceRow(@PrimaryKey val id: String, val noteId: String, val blockId: String?, val attachmentId: String?,
+data class SourceRow(@PrimaryKey val id: String, val noteId: String, val attachmentId: String?,
     val kind: String, val text: String, val offset: Int = 0)
 @Entity(tableName = "postings", indices = [Index("term"), Index("length"), Index("sourceId")])
 data class PostingRow(@PrimaryKey(autoGenerate = true) val id: Long = 0, val sourceId: String, val term: String,
     val length: Int, val start: Int, val end: Int)
 @Entity(tableName = "secrets") data class SecretRow(@PrimaryKey val name: String, val value: ByteArray)
 @Entity(tableName = "imports") data class ImportRow(@PrimaryKey val id: String, val noteId: String,
-    val uri: String, val filename: String, val mime: String, val blockId: String)
+    val uri: String, val filename: String, val mime: String)
 
 @Dao interface NotesDao {
     @Query("SELECT * FROM notes") fun observe(): Flow<List<NoteRow>>

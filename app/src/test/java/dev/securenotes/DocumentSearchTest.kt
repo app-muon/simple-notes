@@ -31,17 +31,17 @@ class DocumentSearchTest {
         assertTrue(SearchText.score("receipt", "receipt") > SearchText.score("reciept", "receipt"))
         assertTrue(SearchText.score("rece", "receipt") > 0)
     }
-    @Test fun `structured notes roundtrip without losing formatting order or IDs`() {
-        val blocks = listOf(Block(type = BlockType.HEADING1, text = "Title", bold = listOf(BoldSpan(0, 5))), Block(type = BlockType.CHECKLIST, text = "Done", checked = true), Block(type = BlockType.FILE, attachmentId = newId()))
-        val doc = Document(blocks = blocks)
+    @Test fun `structured notes roundtrip without losing formatting or attachment order`() {
+        val doc = Document(text = "Title\nDone", lines = listOf(Line(LineType.HEADING1), Line(LineType.CHECKLIST, checked = true)),
+            bold = listOf(BoldSpan(0, 5)), attachments = listOf(newId(), newId()))
         doc.validate()
         assertEquals(doc, documentJson.decodeFromString<Document>(documentJson.encodeToString(doc)))
     }
-    @Test fun `empty draft ignores whitespace but retains images and untitled text`() {
-        assertTrue(Note(title = " \n", document = Document(blocks = listOf(Block(text = "  ")))).isEmpty)
-        val note = Note(document = Document(blocks = listOf(Block(text = "Keep me"))))
+    @Test fun `empty draft ignores whitespace but retains attachments and untitled text`() {
+        assertTrue(Note(title = " \n", document = Document(text = "  ")).isEmpty)
+        val note = Note(document = Document(text = "Keep me"))
         assertFalse(note.isEmpty); assertEquals("Untitled", note.displayTitle)
-        assertFalse(Note(document = Document(blocks = listOf(Block(type = BlockType.IMAGE, attachmentId = newId())))).isEmpty)
+        assertFalse(Note(document = Document(attachments = listOf(newId()))).isEmpty)
     }
     @Test fun `sort modes and edit history maintain expected order`() {
         val a = Note(title = "Zulu", createdAt = 1, updatedAt = 9)
@@ -53,7 +53,10 @@ class DocumentSearchTest {
         assertEquals(a, history.undo(b)); assertEquals(b, history.redo(a)); history.clear(); assertNull(history.undo(b))
     }
     @Test fun `invalid document versions and spans are rejected`() {
-        assertThrows(IllegalArgumentException::class.java) { Document(version = 2).validate() }
-        assertThrows(IllegalArgumentException::class.java) { Document(blocks = listOf(Block(text = "x", bold = listOf(BoldSpan(0, 2))))).validate() }
+        assertThrows(IllegalArgumentException::class.java) { Document(version = 1).validate() }
+        assertThrows(IllegalArgumentException::class.java) { Document(text = "x", bold = listOf(BoldSpan(0, 2))).validate() }
+        assertThrows(IllegalArgumentException::class.java) { Document(text = "a\nb").validate() }
+        assertThrows(IllegalArgumentException::class.java) { Document(text = "abcd", bold = listOf(BoldSpan(0, 3), BoldSpan(2, 4))).validate() }
+        assertThrows(IllegalArgumentException::class.java) { Document(attachments = listOf("not-a-uuid")).validate() }
     }
 }

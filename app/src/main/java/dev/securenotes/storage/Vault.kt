@@ -18,6 +18,7 @@ import dev.securenotes.document.*
 import dev.securenotes.security.Crypto
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
+import kotlinx.serialization.encodeToString
 import net.zetetic.database.sqlcipher.SupportOpenHelperFactory
 import java.io.*
 import java.nio.ByteBuffer
@@ -124,6 +125,28 @@ class Vault(val context: Context, val directory: File, root: ByteArray, val chec
     }
     suspend fun sort(): SortOrder = runCatching { SortOrder.valueOf(preferences.data.first()[sortKey] ?: "EDITED") }.getOrDefault(SortOrder.EDITED)
     suspend fun setSort(sort: SortOrder) { preferences.edit { it[sortKey] = sort.name } }
+    // The old preference is read only when upgrading an existing vault.
+    suspend fun noteOrder(): List<String>? = dao.secret("note-order")?.let {
+        documentJson.decodeFromString<List<String>>(it.toString(Charsets.UTF_8))
+    }
+    suspend fun setNoteOrder(ids: List<String>) {
+        dao.putSecret(SecretRow("note-order", documentJson.encodeToString(ids).toByteArray()))
+    }
+    suspend fun orderedNotes(): List<Note> {
+        val all = dao.notes().map { it.decode() }
+        val stored = noteOrder()
+        if (stored == null) return sortedNotes(all, sort()).also { setNoteOrder(it.map(Note::id)) }
+        val byId = all.associateBy(Note::id)
+        val ids = stored.filter { it in byId }.distinct()
+        val missing = all.filter { it.id !in ids }.sortedWith(compareByDescending<Note> { it.createdAt }.thenBy { it.id })
+        val ordered = missing + ids.map { byId.getValue(it) }
+        if (ordered.map(Note::id) != stored) setNoteOrder(ordered.map(Note::id))
+        return ordered
+    }
+    /** The root wrapped by the recovery passphrase; generation-local so restore publishes it with the generation pointer. */
+    val recoveryFile get() = File(directory, "recovery.key")
+    suspend fun passphrase(): String? = dao.secret("passphrase")?.toString(Charsets.UTF_8)
+    suspend fun passphraseConfirmed(): Boolean = dao.secret("passphrase-confirmed") != null
     override fun close() {
         closed = true
         synchronized(descriptors) { descriptors.forEach { runCatching { it.close() } }; descriptors.clear() }

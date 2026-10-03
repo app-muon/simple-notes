@@ -1,4 +1,4 @@
-@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class, androidx.compose.ui.ExperimentalComposeUiApi::class)
+@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class, androidx.compose.ui.ExperimentalComposeUiApi::class, androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 package dev.securenotes.ui
 
 import android.app.KeyguardManager
@@ -15,7 +15,10 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.foundation.text.selection.DisableSelection
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.*
@@ -31,6 +34,13 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.text.input.ImeAction
+import dev.securenotes.search.HitKind
+import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -52,11 +62,14 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.securenotes.document.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 
 @Composable
-fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: () -> Unit, openFile: (String) -> Unit) {
+fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: () -> Unit, openFile: (String) -> Unit, recover: (CharArray) -> Unit = {}, reveal: () -> Unit = {}) {
     val unlocked by vm.app.unlocked.collectAsStateWithLifecycle()
     // Register while locked as well, so a returning camera can deliver its result after process death.
     val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture(), vm.app.camera::result)
@@ -74,35 +87,59 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
     }) {
     MaterialTheme(colorScheme = if (dark) darkColorScheme(primary = Color(0xFF9AD5B5)) else lightColorScheme(primary = Color(0xFF386A54), background = Color(0xFFFAFAF6))) {
         Surface(Modifier.fillMaxSize()) {
-            if (!unlocked) LockedScreen(authenticate, configureLock) else UnlockedScreens(vm, openFile) { vm.prepareCamera { camera.launch(it) } }
+            if (!unlocked) LockedScreen(vm, authenticate, configureLock, recover) else UnlockedScreens(vm, openFile, reveal) { vm.prepareCamera { camera.launch(it) } }
             vm.error?.let { message -> AlertDialog(onDismissRequest = { vm.error = null }, title = { Text("Unable to finish") }, text = { Text(message) }, confirmButton = { TextButton(onClick = { vm.error = null }) { Text("OK") } }) }
         }
     }
     }
 }
 
-@Composable private fun LockedScreen(authenticate: () -> Unit, configureLock: () -> Unit) {
+@Composable private fun LockedScreen(vm: NotesViewModel, authenticate: () -> Unit, configureLock: () -> Unit, recover: (CharArray) -> Unit) {
     val context = LocalContext.current
     val owner = LocalLifecycleOwner.current
     var secure by remember { mutableStateOf(context.getSystemService(KeyguardManager::class.java).isDeviceSecure) }
+    var recovering by remember { mutableStateOf(false) }
+    // First run lets the user choose between a new store and a restore, so it never prompts automatically.
+    val firstRun = !vm.app.keys.existing && !vm.app.repository.hasVault()
+    val automatic by rememberUpdatedState(secure && !firstRun && !vm.keyUnavailable)
     DisposableEffect(owner) {
         val observer = LifecycleEventObserver { _, event -> if (event == Lifecycle.Event.ON_RESUME) {
             secure = context.getSystemService(KeyguardManager::class.java).isDeviceSecure
-            if (secure) authenticate()
+            if (automatic) authenticate()
         } }
         owner.lifecycle.addObserver(observer)
         onDispose { owner.lifecycle.removeObserver(observer) }
     }
-    LaunchedEffect(Unit) { if (secure && owner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) authenticate() }
+    LaunchedEffect(Unit) { if (automatic && owner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) authenticate() }
     Column(Modifier.fillMaxSize().safeDrawingPadding().padding(32.dp), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
         Icon(Icons.Default.Lock, null, Modifier.size(48.dp), tint = MaterialTheme.colorScheme.primary)
         Spacer(Modifier.height(24.dp)); Text("Secure Notes", style = MaterialTheme.typography.headlineLarge)
-        Spacer(Modifier.height(12.dp)); Text(if (secure) "Your notes stay on this device." else "Set a device PIN, password, or pattern before using your notes.")
-        Spacer(Modifier.height(24.dp)); Button(onClick = if (secure) authenticate else configureLock) { Text(if (secure) "Unlock" else "Set up device lock") }
+        Spacer(Modifier.height(12.dp))
+        when {
+            !secure -> {
+                Text("Set a device PIN, password, or pattern before using your notes.")
+                Spacer(Modifier.height(24.dp)); Button(onClick = configureLock) { Text("Set up device lock") }
+            }
+            vm.keyUnavailable -> {
+                Text("This phone's unlock key for your notes is no longer available, for example because the screen lock was removed. Enter your recovery passphrase to unlock and set up a new key.")
+                Spacer(Modifier.height(24.dp)); Button(onClick = { recovering = true }) { Text("Unlock with recovery passphrase") }
+            }
+            firstRun -> {
+                Text("Your notes stay on this device, encrypted.")
+                Spacer(Modifier.height(24.dp)); Button(onClick = { vm.restoreAfterUnlock = false; authenticate() }) { Text("Create new notes") }
+                Spacer(Modifier.height(8.dp)); OutlinedButton(onClick = { vm.restoreAfterUnlock = true; authenticate() }) { Text("Restore from backup") }
+            }
+            else -> {
+                Text("Your notes stay on this device.")
+                Spacer(Modifier.height(24.dp)); Button(onClick = authenticate) { Text("Unlock") }
+            }
+        }
     }
+    if (recovering) PassphraseDialog(vm.wordlist, "Recovery passphrase", "Enter the ${dev.securenotes.security.Passphrase.WORDS} words you saved when you first set up Secure Notes.", "Unlock",
+        { recovering = false }) { recovering = false; recover(it) }
 }
 
-@Composable private fun UnlockedScreens(vm: NotesViewModel, openFile: (String) -> Unit, takePhoto: () -> Unit) {
+@Composable private fun UnlockedScreens(vm: NotesViewModel, openFile: (String) -> Unit, reveal: () -> Unit, takePhoto: () -> Unit) {
     val context = LocalContext.current
     val focus = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
@@ -111,9 +148,10 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
         uris.forEach { runCatching { context.contentResolver.takePersistableUriPermission(it, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION) } }
         vm.import(uris)
     }
-    val backupPicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { vm.exportBackup(it) }
+    val backupPicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream"), vm::chooseBackup)
     val restorePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument(), vm::selectRestore)
-    LaunchedEffect(vm.backupFile) { if (vm.backupFile != null) backupPicker.launch("SecureNotes-${java.time.LocalDate.now()}.ssnb") }
+    val chooseRestore = { restorePicker.launch(arrayOf("*/*")) }
+    LaunchedEffect(vm.restoreAfterUnlock) { if (vm.restoreAfterUnlock) chooseRestore() }
     val back = { keyboard?.hide(); focus.clearFocus(); vm.back() }
     BackHandler(enabled = vm.screen != Screen.LIST || vm.choosingDestination, onBack = back)
     val activity = androidx.activity.compose.LocalActivity.current
@@ -135,15 +173,29 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
             "Camera" -> takePhoto()
         }
     }
-    when (vm.screen) {
-        Screen.LIST -> NotesList(vm)
-        Screen.SEARCH -> SearchScreen(vm, back)
-        Screen.NOTE -> NoteScreen(vm, back, attach, openFile)
-        Screen.SETTINGS -> SettingsScreen(vm, back) { restorePicker.launch(arrayOf("*/*")) }
-        Screen.IMAGE -> ImageViewer(vm, back)
+    when {
+        vm.restoreAfterUnlock -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Choose a Secure Notes backup file") }
+        // Nothing else is reachable until the recovery passphrase has been confirmed.
+        vm.setupWords != null -> PassphraseSetupScreen(vm, chooseRestore)
+        else -> when (vm.screen) {
+            Screen.LIST -> NotesList(vm)
+            Screen.SEARCH -> SearchScreen(vm, back)
+            Screen.NOTE -> NoteScreen(vm, back, attach, openFile)
+            Screen.SETTINGS -> SettingsScreen(vm, back, reveal, chooseRestore) { backupPicker.launch("SecureNotes.ssnb") }
+            Screen.IMAGE -> ImageViewer(vm, back)
+        }
     }
-    if (vm.share != null && !vm.choosingDestination) AlertDialog(onDismissRequest = { vm.share = null }, title = { Text("Add shared content") }, text = { Text("Choose where to put the shared text or files.") }, confirmButton = { TextButton(onClick = { vm.acceptShare(null) }) { Text("New note") } }, dismissButton = { TextButton(onClick = { vm.choosingDestination = true; vm.screen = Screen.LIST; vm.query = "" }) { Text("Add to existing note") } })
-    vm.passwordMode?.let { mode -> PasswordDialog(mode, { vm.passwordMode = null }, vm::submitPassword) }
+    vm.revealedWords?.let { words -> RevealPassphraseDialog(words) { vm.revealedWords = null } }
+    if (vm.replaceBackup != null) AlertDialog(onDismissRequest = { vm.replaceBackup = null }, title = { Text("Replace existing backup?") },
+        text = { Text("This file already contains a Secure Notes backup. If it came from another phone, it may be your only copy of those notes. Restore it instead, or replace it with a backup of the notes on this phone.") },
+        confirmButton = { TextButton(onClick = vm::restoreChosenBackup) { Text("Restore it") } },
+        dismissButton = { Row {
+            TextButton(onClick = { vm.replaceBackup = null }) { Text("Cancel") }
+            TextButton(onClick = vm::confirmReplaceBackup) { Text("Replace", color = MaterialTheme.colorScheme.error) }
+        } })
+    if (vm.share != null && !vm.choosingDestination && vm.setupWords == null) AlertDialog(onDismissRequest = { vm.share = null }, title = { Text("Add shared content") }, text = { Text("Choose where to put the shared text or files.") }, confirmButton = { TextButton(onClick = { vm.acceptShare(null) }) { Text("New note") } }, dismissButton = { TextButton(onClick = { vm.choosingDestination = true; vm.screen = Screen.LIST; vm.query = "" }) { Text("Add to existing note") } })
+    if (vm.passwordMode != null) PassphraseDialog(vm.wordlist, "Backup passphrase", "Enter the recovery passphrase of the phone that made this backup. It becomes this phone's recovery passphrase.", "Continue",
+        { vm.passwordMode = null }, vm::submitPassword)
     vm.restoreCount?.let { count -> AlertDialog(onDismissRequest = vm::cancelRestore, title = { Text("Replace all notes?") }, text = { Text("This backup contains $count notes. All current notes, attachments, and settings will be permanently replaced. No safety backup will be created.") }, confirmButton = { TextButton(onClick = vm::restore) { Text("Replace everything") } }, dismissButton = { TextButton(onClick = vm::cancelRestore) { Text("Cancel") } }) }
     vm.busy?.let { message -> AlertDialog(onDismissRequest = {}, title = { Text(message) }, text = { LinearProgressIndicator(Modifier.fillMaxWidth()) }, confirmButton = { TextButton(onClick = vm::cancelOperation) { Text("Cancel") } }) }
     if (vm.cameraRecovery) AlertDialog(onDismissRequest = {}, title = { Text("Unfinished photo") }, text = { Text("A camera capture was interrupted. Keep the photo if it was taken, or discard the capture.") }, confirmButton = { TextButton(onClick = { vm.resolveCamera(true) }) { Text("Keep photo") } }, dismissButton = { TextButton(onClick = { vm.resolveCamera(false) }) { Text("Discard") } })
@@ -151,12 +203,11 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
 
 @Composable private fun NotesList(vm: NotesViewModel) {
     val all by vm.repository.notes.collectAsStateWithLifecycle()
-    val sort by vm.repository.sort.collectAsStateWithLifecycle()
-    val sorted = remember(all, sort) { sortedNotes(all, sort) }
+    val sorted = all
     val filtered = if (vm.choosingDestination && vm.query.isNotBlank()) sorted.filter { n -> vm.results.any { it.noteId == n.id } } else sorted
     val state = rememberLazyListState()
     LaunchedEffect(Unit) { val index = sorted.indexOfFirst { it.id == vm.listAnchor }; if (index >= 0) state.scrollToItem(index, vm.listOffset) }
-    Scaffold(topBar = { LargeTopAppBar(title = { Text(if (vm.choosingDestination) "Add to note" else "Notes") }, actions = {
+    Scaffold(topBar = { TopAppBar(expandedHeight = 56.dp, modifier = Modifier.then(Modifier.semantics { contentDescription = "Notes toolbar" }), title = { Text(if (vm.choosingDestination) "Add to note" else "Notes") }, actions = {
         if (vm.choosingDestination) TextButton(onClick = { vm.share = null; vm.choosingDestination = false; vm.query = "" }) { Text("Cancel") }
         else {
             IconButton(onClick = { vm.query = ""; vm.results = emptyList(); vm.screen = Screen.SEARCH }) { Icon(Icons.Default.Search, "Search") }
@@ -166,7 +217,11 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
         Column(Modifier.padding(padding).fillMaxSize()) {
             if (vm.choosingDestination) OutlinedTextField(vm.query, vm::search, Modifier.fillMaxWidth().padding(16.dp), label = { Text("Search notes") }, singleLine = true)
             if (filtered.isEmpty()) Box(Modifier.fillMaxSize().padding(32.dp), contentAlignment = Alignment.Center) { Text(if (all.isEmpty()) "A quiet place for your notes.\nTap + to begin." else "No matching notes", color = MaterialTheme.colorScheme.onSurfaceVariant) }
-            LazyColumn(state = state, contentPadding = PaddingValues(bottom = 96.dp)) {
+            if (!vm.choosingDestination) ReorderableNotesList(all, state, onOpen = { note ->
+                vm.listAnchor = all.getOrNull(state.firstVisibleItemIndex)?.id; vm.listOffset = state.firstVisibleItemScrollOffset
+                vm.open(note)
+            }, onReorder = vm::reorderNotes)
+            else LazyColumn(state = state, contentPadding = PaddingValues(bottom = 96.dp)) {
                 items(filtered, key = { it.id }) { note ->
                     Column(Modifier.fillMaxWidth().clickable {
                         vm.listAnchor = filtered.getOrNull(state.firstVisibleItemIndex)?.id; vm.listOffset = state.firstVisibleItemScrollOffset
@@ -198,146 +253,178 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
 
 @Composable private fun NoteScreen(vm: NotesViewModel, back: () -> Unit, attach: (String) -> Unit, openFile: (String) -> Unit) {
     val note = vm.note ?: return
-    val state = rememberLazyListState()
     val titleFocus = remember { FocusRequester() }
-    var editor by remember { mutableStateOf<BlockEditText?>(null) }
+    var editor by remember { mutableStateOf<BodyEditText?>(null) }
+    var selectionRevision by remember { mutableIntStateOf(0) }
     var delete by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     var highlight by remember(note.id) { mutableStateOf(vm.hit) }
     val keyboard = LocalSoftwareKeyboardController.current
     val focus = LocalFocusManager.current
+    val scroll = rememberScrollState()
+    // Positions inside the scrolled content, used to jump to a search match.
+    var content by remember { mutableStateOf<LayoutCoordinates?>(null) }
+    val lineTops = remember(note.id) { mutableStateMapOf<Int, Int>() }
+    var attachmentsTop by remember(note.id) { mutableIntStateOf(0) }
     LaunchedEffect(vm.focusTitle, vm.editing) { if (vm.editing && vm.focusTitle) { titleFocus.requestFocus(); keyboard?.show() } }
-    LaunchedEffect(vm.focusedBlock, vm.editing) {
-        if (vm.editing) {
-            val index = note.document.blocks.indexOfFirst { it.id == vm.focusedBlock }
-            if (index >= 0) state.animateScrollToItem(index + 1)
-        }
+    LaunchedEffect(vm.bodyFocus, editor) {
+        val offset = vm.bodyFocus ?: return@LaunchedEffect
+        val body = editor ?: return@LaunchedEffect
+        body.focusAt(offset); vm.focusTitle = false; vm.bodyFocus = null
     }
     LaunchedEffect(note.id, vm.hit) {
         vm.hit?.let { hit ->
-            val index = note.document.blocks.indexOfFirst { it.id == hit.blockId }
-            state.scrollToItem(if (index >= 0) index + 1 else 0)
+            val top = when (hit.kind) {
+                HitKind.TITLE -> 0
+                HitKind.BODY -> {
+                    val line = DocumentEdits.lineAt(note.document.text, hit.start)
+                    withTimeoutOrNull(1_000) { snapshotFlow { lineTops[line] }.filterNotNull().first() } ?: 0
+                }
+                HitKind.ATTACHMENT -> attachmentsTop
+            }
+            scroll.scrollTo(top)
             delay(2200); highlight = null
         }
     }
-    Scaffold(modifier = Modifier.imePadding(), topBar = { TopAppBar(title = { Text(if (vm.editing) "Editing" else "Note", style = MaterialTheme.typography.titleMedium) }, navigationIcon = { BackButton(back) }, actions = {
+    val leave = { keyboard?.hide(); focus.clearFocus(); vm.back() }
+    val barColor by animateColorAsState(if (vm.editing) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface, label = "Editing header")
+    Scaffold(modifier = Modifier.imePadding(), topBar = { TopAppBar(colors = TopAppBarDefaults.topAppBarColors(containerColor = barColor),
+        title = { Text(if (vm.editing) "Editing" else "Note", style = MaterialTheme.typography.titleMedium) }, navigationIcon = { BackButton(back) }, actions = {
+        if (vm.editing) IconButton(onClick = leave) { Icon(Icons.Default.Check, "Done") }
         Box {
             IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "Note menu") }
             DropdownMenu(menu, { menu = false }) { DropdownMenuItem(text = { Text("Delete") }, leadingIcon = { Icon(Icons.Default.DeleteOutline, null) }, onClick = { menu = false; delete = true }) }
         }
-    }) }, bottomBar = { if (vm.editing) EditorToolbar(vm, { editor?.bold() }, attach) }) { padding ->
-        LazyColumn(state = state, modifier = Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(start = 24.dp, end = 24.dp, bottom = 100.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            item(key = "title") {
-                if (vm.editing) OutlinedTextField(note.title, { vm.change(note.copy(title = it)) }, modifier = Modifier.fillMaxWidth().focusRequester(titleFocus).onFocusChanged { if (it.isFocused) { editor = null; vm.focusedBlock = null } }, placeholder = { Text("Title") }, textStyle = MaterialTheme.typography.headlineLarge, singleLine = true)
-                else SelectionContainer { Text(note.displayTitle, Modifier.fillMaxWidth().clickable { vm.enterEditing() }.padding(vertical = 12.dp)
-                    .background(if (highlight != null && highlight?.blockId == null) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent), style = MaterialTheme.typography.headlineLarge) }
-            }
-            items(note.document.blocks, key = { it.id }) { block ->
-                val selected = highlight?.blockId == block.id
-                if (block.isAttachment) AttachmentBlock(vm, block, selected, openFile, state)
-                else Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
-                    when (block.type) {
-                        BlockType.CHECKLIST -> Checkbox(block.checked, { vm.block(block.copy(checked = it)) }, modifier = Modifier.semantics { contentDescription = if (block.text.isBlank()) "Checklist item" else block.text })
-                        BlockType.BULLET -> Text("•", Modifier.padding(end = 12.dp, top = 8.dp), fontSize = 20.sp)
-                        BlockType.NUMBERED -> {
-                            val index = note.document.blocks.indexOf(block)
-                            val number = note.document.blocks.take(index + 1).takeLastWhile { it.type == BlockType.NUMBERED }.size
-                            Text("$number.", Modifier.padding(end = 12.dp, top = 8.dp), fontSize = 18.sp)
-                        }
-                        else -> Unit
-                    }
-                    if (vm.editing) RichTextEditor(block, MaterialTheme.colorScheme.onSurface, vm.focusedBlock == block.id, Modifier.weight(1f),
-                        onFocus = { editor = it; vm.focusedBlock = block.id; vm.focusTitle = false },
-                        onChange = { text, spans -> vm.split(block.id, text, spans) }, onJoin = { vm.joinPrevious(block.id) }, onLeave = { keyboard?.hide(); focus.clearFocus(); vm.back() }, focusOffset = vm.focusOffset)
-                    else {
-                        val match = if (selected) highlight else null
-                        val text = annotated(block, match?.start, match?.end, MaterialTheme.colorScheme.secondaryContainer, MaterialTheme.colorScheme.primary)
-                        SelectionContainer { Text(text, modifier = Modifier.weight(1f).heightIn(min = 48.dp).clickable { vm.enterEditing(block.id) }.padding(vertical = 6.dp), style = when (block.type) { BlockType.HEADING1 -> MaterialTheme.typography.headlineMedium; BlockType.HEADING2 -> MaterialTheme.typography.titleLarge; else -> MaterialTheme.typography.bodyLarge }) }
-                    }
+    }) }, bottomBar = { if (vm.editing) EditorToolbar(vm, editor, selectionRevision) }) { padding ->
+        Column(Modifier.fillMaxSize().padding(padding).verticalScroll(scroll).onGloballyPositioned { content = it }
+            .padding(start = 24.dp, end = 24.dp, bottom = 100.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (vm.editing) {
+                OutlinedTextField(note.title, { vm.change(note.copy(title = it), typing = true) }, modifier = Modifier.fillMaxWidth().focusRequester(titleFocus),
+                    placeholder = { Text("Title") }, textStyle = MaterialTheme.typography.headlineLarge, singleLine = true,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next), keyboardActions = KeyboardActions(onNext = { vm.bodyFocus = note.document.text.length }))
+                RichBodyEditor(note.document, MaterialTheme.colorScheme.onSurface, MaterialTheme.colorScheme.primary, Modifier.fillMaxWidth().heightIn(min = 160.dp),
+                    onReady = { editor = it }, onChange = vm::editBody, onSelection = { selectionRevision++ }, onLeave = leave)
+            } else SelectionContainer {
+                // One selection area for the whole note, so Select All and copy span every line.
+                Column {
+                    Text(note.displayTitle, Modifier.fillMaxWidth().clickable { vm.enterEditing() }.padding(vertical = 12.dp)
+                        .background(if (highlight?.kind == HitKind.TITLE) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent), style = MaterialTheme.typography.headlineLarge)
+                    ReadingBody(vm, note, highlight) { line, coordinates -> content?.let { lineTops[line] = it.localPositionOf(coordinates, Offset.Zero).y.toInt() } }
                 }
             }
-            if (vm.editing) item { TextButton(onClick = { vm.addText() }) { Icon(Icons.Default.Add, null); Text("Text") } }
+            AttachmentsSection(vm, note, highlight, attach, openFile, Modifier.onGloballyPositioned { c -> content?.let { attachmentsTop = it.localPositionOf(c, Offset.Zero).y.toInt() } })
         }
     }
     if (delete) AlertDialog(onDismissRequest = { delete = false }, title = { Text("Delete this note?") }, text = { Text("This permanently deletes the note and its attachments.") }, confirmButton = { TextButton(onClick = { delete = false; vm.delete() }) { Text("Delete") } }, dismissButton = { TextButton(onClick = { delete = false }) { Text("Cancel") } })
 }
 
-private fun annotated(block: Block, start: Int?, end: Int?, highlight: Color, linkColor: Color): AnnotatedString = buildAnnotatedString {
-    append(block.text.ifEmpty { " " })
-    block.bold.forEach { addStyle(SpanStyle(fontWeight = FontWeight.Bold), it.start, it.end) }
-    if (start != null && end != null && start >= 0 && end <= length && start < end) addStyle(SpanStyle(background = highlight), start, end)
-    val links = android.text.SpannableString(block.text)
+/** Reading mode: one Text per line inside the caller's selection area; list markers are not selectable. */
+@Composable private fun ReadingBody(vm: NotesViewModel, note: Note, highlight: dev.securenotes.search.SearchHit?, placed: (Int, LayoutCoordinates) -> Unit) {
+    val document = note.document
+    val starts = remember(document.text) { DocumentEdits.lineStarts(document.text) }
+    document.lines.forEachIndexed { i, line ->
+        val start = starts[i]
+        val end = if (i + 1 < starts.size) starts[i + 1] - 1 else document.text.length
+        val match = highlight?.takeIf { it.kind == HitKind.BODY && it.start >= start && it.end <= end }
+        Row(Modifier.fillMaxWidth().onGloballyPositioned { placed(i, it) }, verticalAlignment = Alignment.CenterVertically) {
+            DisableSelection {
+                when (line.type) {
+                    LineType.CHECKLIST -> Checkbox(line.checked, { vm.setChecked(i, it) }, modifier = Modifier.semantics { contentDescription = document.text.substring(start, end).ifBlank { "Checklist item" } })
+                    LineType.BULLET -> Text("•", Modifier.padding(start = 4.dp, end = 12.dp), fontSize = 20.sp)
+                    LineType.NUMBERED -> Text("${DocumentEdits.numberFor(document, i)}.", Modifier.padding(end = 12.dp), fontSize = 18.sp)
+                    else -> Unit
+                }
+            }
+            Text(annotatedLine(document, start, end, match, MaterialTheme.colorScheme.secondaryContainer, MaterialTheme.colorScheme.primary),
+                Modifier.weight(1f).clickable { vm.enterEditing(end) }.padding(vertical = 4.dp),
+                style = when (line.type) { LineType.HEADING1 -> MaterialTheme.typography.headlineMedium; LineType.HEADING2 -> MaterialTheme.typography.titleLarge; else -> MaterialTheme.typography.bodyLarge })
+        }
+    }
+}
+
+private fun annotatedLine(document: Document, start: Int, end: Int, match: dev.securenotes.search.SearchHit?, highlight: Color, linkColor: Color): AnnotatedString = buildAnnotatedString {
+    val text = document.text.substring(start, end)
+    append(text.ifEmpty { " " })
+    document.bold.forEach { span ->
+        val a = maxOf(span.start, start) - start; val b = minOf(span.end, end) - start
+        if (b > a) addStyle(SpanStyle(fontWeight = FontWeight.Bold), a, b)
+    }
+    match?.let { if (it.end - start <= text.length) addStyle(SpanStyle(background = highlight), it.start - start, it.end - start) }
+    val links = android.text.SpannableString(text)
     androidx.core.text.util.LinkifyCompat.addLinks(links, android.text.util.Linkify.WEB_URLS or android.text.util.Linkify.EMAIL_ADDRESSES or android.text.util.Linkify.PHONE_NUMBERS)
     links.getSpans(0, links.length, android.text.style.URLSpan::class.java).forEach { span ->
         addLink(LinkAnnotation.Url(span.url, TextLinkStyles(SpanStyle(color = linkColor, textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline))), links.getSpanStart(span), links.getSpanEnd(span))
     }
 }
 
-@Composable private fun EditorToolbar(vm: NotesViewModel, bold: () -> Unit, attach: (String) -> Unit) {
-    var menu by remember { mutableStateOf(false) }
+/** Formatting toggles act on every line in the editor's selection and show the current line's format. */
+@Composable private fun EditorToolbar(vm: NotesViewModel, editor: BodyEditText?, selectionRevision: Int) {
     val revision = vm.historyRevision
+    val active = remember(editor, selectionRevision, revision) { editor?.activeType() }
+    val bold = remember(editor, selectionRevision, revision) { editor?.isBold() == true }
+    @Composable fun Toggle(type: LineType, label: String, icon: androidx.compose.ui.graphics.vector.ImageVector?) {
+        IconToggleButton(checked = active == type, onCheckedChange = { editor?.toggleLine(type) }, enabled = editor != null) {
+            if (icon != null) Icon(icon, label) else Text(label, fontWeight = FontWeight.Bold)
+        }
+    }
     Surface(tonalElevation = 3.dp) {
         Row(Modifier.fillMaxWidth().navigationBarsPadding().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box {
-                IconButton(onClick = { menu = true }) { Icon(Icons.Default.Add, "Attach") }
-                DropdownMenu(menu, { menu = false }) { listOf("Photo", "Camera", "File").forEach { option -> DropdownMenuItem(text = { Text(option) }, onClick = { menu = false; attach(option) }) } }
-            }
             IconButton(onClick = vm::undo, enabled = revision >= 0 && vm.history.canUndo) { Icon(Icons.AutoMirrored.Filled.Undo, "Undo") }
             IconButton(onClick = vm::redo, enabled = vm.history.canRedo) { Icon(Icons.AutoMirrored.Filled.Redo, "Redo") }
-            IconButton(onClick = bold) { Icon(Icons.Default.FormatBold, "Bold selected text") }
-            TextButton(onClick = { vm.format(BlockType.PARAGRAPH) }) { Text("Text") }
-            TextButton(onClick = { vm.format(BlockType.HEADING1) }) { Text("H1") }
-            TextButton(onClick = { vm.format(BlockType.HEADING2) }) { Text("H2") }
-            IconButton(onClick = { vm.format(BlockType.BULLET) }) { Icon(Icons.AutoMirrored.Filled.FormatListBulleted, "Bullet list") }
-            IconButton(onClick = { vm.format(BlockType.NUMBERED) }) { Icon(Icons.Default.FormatListNumbered, "Numbered list") }
-            IconButton(onClick = { vm.format(BlockType.CHECKLIST) }) { Icon(Icons.Default.Checklist, "Checklist") }
+            IconToggleButton(checked = bold, onCheckedChange = { editor?.toggleBold() }, enabled = editor != null) { Icon(Icons.Default.FormatBold, "Bold") }
+            Toggle(LineType.HEADING1, "H1", null)
+            Toggle(LineType.HEADING2, "H2", null)
+            Toggle(LineType.BULLET, "Bullet list", Icons.AutoMirrored.Filled.FormatListBulleted)
+            Toggle(LineType.NUMBERED, "Numbered list", Icons.Default.FormatListNumbered)
+            Toggle(LineType.CHECKLIST, "Checklist", Icons.Default.Checklist)
         }
     }
 }
 
-@Composable private fun AttachmentBlock(vm: NotesViewModel, block: Block, highlighted: Boolean, openFile: (String) -> Unit, listState: androidx.compose.foundation.lazy.LazyListState) {
-    val id = block.attachmentId ?: return
-    val attachment = vm.attachments[id] ?: return
+/** Images and files live here, below the text, in both modes. Editing adds [+] and per-item Move/Remove. */
+@Composable private fun AttachmentsSection(vm: NotesViewModel, note: Note, highlight: dev.securenotes.search.SearchHit?, attach: (String) -> Unit, openFile: (String) -> Unit, modifier: Modifier) {
+    val ids = note.document.attachments
+    if (ids.isEmpty() && !vm.editing) return
     var menu by remember { mutableStateOf(false) }
-    var drag by remember { mutableFloatStateOf(0f) }
-    var dragging by remember { mutableStateOf(false) }
-    val bitmap by attachmentBitmap(vm, id, 1200)
-    val dragModifier = if (vm.editing) Modifier.pointerInput(block.id) {
-        detectDragGesturesAfterLongPress(
-            onDragStart = { drag = 0f; dragging = true },
-            onDragCancel = { drag = 0f; dragging = false },
-            onDragEnd = {
-                val items = listState.layoutInfo.visibleItemsInfo
-                val current = items.firstOrNull { it.key == block.id }
-                if (current != null) {
-                    val center = current.offset + current.size / 2f + drag
-                    val blocks = vm.note?.document?.blocks.orEmpty()
-                    val target = items.filter { item -> blocks.any { it.id == item.key } }.minByOrNull { kotlin.math.abs(it.offset + it.size / 2f - center) }
-                    val from = blocks.indexOfFirst { it.id == block.id }
-                    val to = target?.let { item -> blocks.indexOfFirst { it.id == item.key } } ?: -1
-                    if (from >= 0 && to >= 0) vm.move(block.id, to - from)
-                }
-                drag = 0f; dragging = false
-            },
-            onDrag = { change, amount ->
-                change.consume(); drag += amount.y
-            },
-        )
-    } else Modifier
-    Card(Modifier.fillMaxWidth().zIndex(if (dragging) 1f else 0f).graphicsLayer { translationY = drag }.then(dragModifier),
-        border = if (dragging) BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else null,
-        colors = CardDefaults.cardColors(containerColor = if (highlighted || dragging) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceContainer)) {
-        if (block.type == BlockType.IMAGE && bitmap != null) Image(bitmap!!.asImageBitmap(), attachment.filename, Modifier.fillMaxWidth().heightIn(max = 360.dp).clickable { if (!vm.editing) { vm.imageId = id; vm.screen = Screen.IMAGE } else menu = true })
-        Row(Modifier.fillMaxWidth().clickable { if (!vm.editing) { if (block.type == BlockType.IMAGE) { vm.imageId = id; vm.screen = Screen.IMAGE } else openFile(id) } else menu = true }.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(if (block.type == BlockType.IMAGE) Icons.Default.Image else Icons.AutoMirrored.Filled.InsertDriveFile, null)
-            Text(attachment.filename, Modifier.weight(1f).padding(horizontal = 12.dp), maxLines = 2, overflow = TextOverflow.Ellipsis)
+    Column(modifier.fillMaxWidth().padding(top = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Attachments", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (vm.editing) Box {
-                IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "Attachment options") }
-                DropdownMenu(menu, { menu = false }) {
-                    DropdownMenuItem(text = { Text("Move up") }, onClick = { menu = false; vm.move(block.id, -1) })
-                    DropdownMenuItem(text = { Text("Move down") }, onClick = { menu = false; vm.move(block.id, 1) })
-                    DropdownMenuItem(text = { Text("Remove attachment") }, onClick = { menu = false; vm.removeBlock(block.id) })
-                }
+                IconButton(onClick = { menu = true }) { Icon(Icons.Default.Add, "Add attachment") }
+                DropdownMenu(menu, { menu = false }) { listOf("Photo", "Camera", "File").forEach { option -> DropdownMenuItem(text = { Text(option) }, onClick = { menu = false; attach(option) }) } }
+            }
+        }
+        if (ids.isEmpty()) Text("Add photos or files with +.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            ids.forEachIndexed { index, id -> key(id) { AttachmentTile(vm, id, index, ids.size, highlight?.attachmentId == id, openFile) } }
+        }
+    }
+}
+
+@Composable private fun AttachmentTile(vm: NotesViewModel, id: String, index: Int, count: Int, highlighted: Boolean, openFile: (String) -> Unit) {
+    val attachment = vm.attachments[id] ?: return
+    val image = attachment.mime.startsWith("image/")
+    val bitmap by attachmentBitmap(vm, id, 400)
+    var menu by remember { mutableStateOf(false) }
+    Box {
+        Card(Modifier.size(104.dp).clickable { if (image) { vm.imageId = id; vm.screen = Screen.IMAGE } else openFile(id) },
+            border = if (highlighted) BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else null,
+            colors = CardDefaults.cardColors(containerColor = if (highlighted) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceContainer)) {
+            val shown = bitmap
+            if (image && shown != null) Image(shown.asImageBitmap(), attachment.filename, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+            else Column(Modifier.fillMaxSize().padding(8.dp), verticalArrangement = Arrangement.SpaceBetween) {
+                Icon(if (image) Icons.Default.Image else Icons.AutoMirrored.Filled.InsertDriveFile, null)
+                Text(attachment.filename, style = MaterialTheme.typography.labelSmall, maxLines = 3, overflow = TextOverflow.Ellipsis)
+            }
+        }
+        if (vm.editing) {
+            IconButton(onClick = { menu = true }, modifier = Modifier.align(Alignment.TopEnd).size(36.dp)
+                .background(MaterialTheme.colorScheme.surface.copy(alpha = .85f), androidx.compose.foundation.shape.CircleShape)) { Icon(Icons.Default.MoreVert, "Options for ${attachment.filename}") }
+            DropdownMenu(menu, { menu = false }) {
+                DropdownMenuItem(text = { Text("Move left") }, enabled = index > 0, onClick = { menu = false; vm.moveAttachment(id, -1) })
+                DropdownMenuItem(text = { Text("Move right") }, enabled = index < count - 1, onClick = { menu = false; vm.moveAttachment(id, 1) })
+                DropdownMenuItem(text = { Text("Remove") }, onClick = { menu = false; vm.removeAttachment(id) })
             }
         }
     }
@@ -361,35 +448,31 @@ private fun annotated(block: Block, start: Int?, end: Int?, highlight: Color, li
     }
 }
 
-@Composable private fun SettingsScreen(vm: NotesViewModel, back: () -> Unit, restore: () -> Unit) {
-    val sort by vm.repository.sort.collectAsStateWithLifecycle()
+@Composable private fun SettingsScreen(vm: NotesViewModel, back: () -> Unit, reveal: () -> Unit, restore: () -> Unit, chooseBackup: () -> Unit) {
+    val status by vm.app.autoBackup.status.collectAsStateWithLifecycle()
     Scaffold(topBar = { TopAppBar(title = { Text("Settings") }, navigationIcon = { BackButton(back) }) }) { padding ->
         Column(Modifier.padding(padding).verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("Notes", style = MaterialTheme.typography.titleLarge)
-            Text("Sort order", color = MaterialTheme.colorScheme.onSurfaceVariant)
-            SortOrder.entries.forEach { order -> Row(Modifier.fillMaxWidth().clickable { vm.task(null, "Settings could not be saved.") { vm.repository.setSort(order) } }, verticalAlignment = Alignment.CenterVertically) {
-                RadioButton(sort == order, { vm.task(null, "Settings could not be saved.") { vm.repository.setSort(order) } }); Text(order.label)
-            } }
-            HorizontalDivider(Modifier.padding(vertical = 12.dp))
-            Text("Backup & restore", style = MaterialTheme.typography.titleLarge)
-            TextButton(onClick = { vm.passwordMode = "configure" }) { Text("Configure / change backup password") }
-            FilledTonalButton(onClick = vm::requestBackup, modifier = Modifier.fillMaxWidth()) { Text("Create encrypted backup") }
-            OutlinedButton(onClick = restore, modifier = Modifier.fillMaxWidth()) { Text("Restore encrypted backup") }
+            Text("Recovery passphrase", style = MaterialTheme.typography.titleLarge)
+            Text("Your ${dev.securenotes.security.Passphrase.WORDS}-word passphrase opens your notes on a new phone and encrypts your backups.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            OutlinedButton(onClick = reveal, modifier = Modifier.fillMaxWidth()) { Text("View recovery passphrase") }
+            Spacer(Modifier.height(8.dp))
+            Text("Automatic backup", style = MaterialTheme.typography.titleLarge)
+            val location = status?.location
+            if (location == null) {
+                Text("Choose a file, for example in Dropbox or Google Drive. Secure Notes keeps it updated with an encrypted copy of all notes and attachments whenever they change.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                FilledTonalButton(onClick = chooseBackup, modifier = Modifier.fillMaxWidth()) { Text("Choose backup file") }
+            } else {
+                Text(location, style = MaterialTheme.typography.titleMedium)
+                Text(status?.savedAt?.let { "Last saved " + java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT).format(java.util.Date(it)) } ?: "Not saved yet", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                status?.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                FilledTonalButton(onClick = vm::backupNow, modifier = Modifier.fillMaxWidth()) { Text("Back up now") }
+                OutlinedButton(onClick = chooseBackup, modifier = Modifier.fillMaxWidth()) { Text("Change backup file") }
+                TextButton(onClick = vm::turnOffBackup, modifier = Modifier.fillMaxWidth()) { Text("Turn off automatic backup") }
+            }
+            OutlinedButton(onClick = restore, modifier = Modifier.fillMaxWidth()) { Text("Restore from backup") }
             Spacer(Modifier.height(16.dp)); Text("Secure Notes · ${dev.securenotes.BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
-}
-
-@Composable private fun PasswordDialog(mode: String, dismiss: () -> Unit, submit: (CharArray) -> Unit) {
-    var password by remember { mutableStateOf("") }; var confirmation by remember { mutableStateOf("") }
-    val configure = mode.startsWith("configure")
-    AlertDialog(onDismissRequest = { password = ""; confirmation = ""; dismiss() }, title = { Text(if (configure) "Backup password" else "Enter backup password") }, text = {
-        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            if (configure) Text("If you forget this backup password, the encrypted backup cannot be recovered. Changing it only affects future backups.")
-            OutlinedTextField(password, { password = it }, label = { Text("Password") }, visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password), singleLine = true)
-            if (configure) OutlinedTextField(confirmation, { confirmation = it }, label = { Text("Confirm password") }, visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password), singleLine = true)
-        }
-    }, confirmButton = { TextButton(enabled = password.isNotEmpty() && (!configure || password == confirmation), onClick = { val chars = password.toCharArray(); password = ""; confirmation = ""; submit(chars) }) { Text(if (configure) "Configure" else "Continue") } }, dismissButton = { TextButton(onClick = { password = ""; confirmation = ""; dismiss() }) { Text("Cancel") } })
 }
 
 @Composable private fun BackButton(back: () -> Unit) { IconButton(onClick = back) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } }

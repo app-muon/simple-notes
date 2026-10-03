@@ -10,7 +10,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import java.io.File
 
-@Serializable private data class Capture(val id: String, val noteId: String, val blockId: String)
+@Serializable private data class Capture(val id: String, val noteId: String)
 
 /** Destination lives in SQLCipher; only a non-sensitive completion flag is readable while locked. */
 class CameraCapture(private val context: Context, private val repository: NotesRepository) {
@@ -26,7 +26,7 @@ class CameraCapture(private val context: Context, private val repository: NotesR
         check(pending() == null) { "A capture is pending" }
         repository.flush()
         repository.save(note, preserveEmpty = true)
-        val capture = Capture(newId(), note.id, newId())
+        val capture = Capture(newId(), note.id)
         file(capture).createNewFile(); resultFile.delete()
         try { repository.access { it.dao.putSecret(SecretRow("pending-camera", documentJson.encodeToString(capture).toByteArray())) } }
         catch (e: Exception) { file(capture).delete(); throw e }
@@ -52,7 +52,7 @@ class CameraCapture(private val context: Context, private val repository: NotesR
         if (success && initial != null) {
             check(file(capture).length() > 0) { "Camera returned no photo" }
             // Stable IDs make recovery safe if the process dies immediately after import commits.
-            updated = repository.import(initial, uri(capture), "image/jpeg", capture.id, capture.blockId)
+            updated = repository.import(initial, uri(capture), "image/jpeg", capture.id)
         } else if (initial?.isEmpty == true) repository.delete(initial.id)
         repository.access { it.dao.deleteSecret("pending-camera") }
         context.revokeUriPermission(uri(capture), Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)

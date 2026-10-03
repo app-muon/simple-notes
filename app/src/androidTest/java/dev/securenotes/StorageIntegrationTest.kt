@@ -31,8 +31,11 @@ class StorageIntegrationTest {
         val isolated = object : ContextWrapper(context) { override fun getNoBackupFilesDir(): File = directory }
         repository = NotesRepository(isolated) { if (!authorized) throw CancellationException("Locked") }
         repository.open(root.copyOf())
+        repository.ensurePassphrase { phrase }
         backup = BackupService(context, repository) {}
     }
+    private val phrase = "cherisher driven greedily motion pyramid skipping unbundle vertigo"
+    private val otherPhrase = "vertigo unbundle skipping pyramid motion greedily driven cherisher"
     @After fun cleanup() = runBlocking {
         if (::backup.isInitialized) backup.discard()
         if (::repository.isInitialized) repository.close()
@@ -72,11 +75,11 @@ class StorageIntegrationTest {
         assertEquals(note, repository.notes.value.single()); assertFalse(journal.exists())
     }
     @Test fun exactPrefixAndFuzzySearchSurviveMoreThanTenThousandPostings() = runBlocking {
-        repository.save(Note(title = "Noise", document = Document(blocks = listOf(Block(text = "zzzzzzz ".repeat(10_050))))))
-        val target = Note(title = "Target", document = Document(blocks = listOf(Block(text = "receipt"))))
+        repository.save(Note(title = "Noise", document = Document(text = "zzzzzzz ".repeat(10_050))))
+        val target = Note(title = "Target", document = Document(text = "receipt"))
         repository.save(target)
         for (query in listOf("receipt", "rece", "reciept")) assertEquals(target.id, repository.search(query).single().noteId)
-        val repeated = Note(title = "Many receipts", document = Document(blocks = listOf(Block(text = "receipt ".repeat(10_050)))))
+        val repeated = Note(title = "Many receipts", document = Document(text = "receipt ".repeat(10_050)))
         repository.save(repeated)
         assertEquals(setOf(target.id, repeated.id), repository.search("receipt").map { it.noteId }.toSet())
     }
@@ -100,7 +103,7 @@ class StorageIntegrationTest {
         val recreated = dev.securenotes.storage.CameraCapture(isolated, repository)
         recreated.cleanOrphans(); recreated.result(true)
         val restored = recreated.finish()!!
-        assertEquals(note.id, restored.id); assertEquals(1, restored.document.blocks.count { it.isAttachment })
+        assertEquals(note.id, restored.id); assertEquals(1, restored.document.attachments.size)
         assertNull(recreated.finish()); assertEquals(1, repository.attachments().size)
         assertFalse(recreated.hasPending())
     }
@@ -119,7 +122,7 @@ class StorageIntegrationTest {
         }
     }
     @Test fun encryptedNotesPersistSearchAndDelete() = runBlocking {
-        val note = Note(title = "Holiday", document = Document(blocks = listOf(Block(text = "Café receipt"))))
+        val note = Note(title = "Holiday", document = Document(text = "Café receipt"))
         repository.save(note)
         assertEquals(note.id, repository.search("cafe reciept").single().noteId)
         val file = repository.vault!!.directory.resolve("notes.db")
@@ -164,29 +167,90 @@ class StorageIntegrationTest {
     }
     @Test fun backupRestoresAllContentAndSettingsOnlyAfterCommit() = runBlocking {
         val original = repository.import(Note(title = "Original"), source("attachment.txt", "Keep this".toByteArray()))
-        repository.setSort(SortOrder.ALPHABETICAL)
-        backup.configure("a separate backup password".toCharArray())
-        val encrypted = backup.create("a separate backup password".toCharArray()) {}
+        val second = Note(title = "Second"); repository.save(second)
+        repository.reorder(listOf(original.id, second.id))
+        val (encrypted, fingerprint) = backup.create({})!!
         sources += encrypted
+        assertNull(backup.create({}, unchangedSince = fingerprint))
         val uri = source("backup.ssnb", encrypted.readBytes())
-        repository.delete(original.id); repository.save(Note(title = "Current")); repository.setSort(SortOrder.CREATED)
-        assertEquals(1, backup.stage(uri, "a separate backup password".toCharArray()) {})
+        repository.delete(original.id); repository.delete(second.id); repository.save(Note(title = "Current"))
+        assertEquals(2, backup.stage(uri, phrase.uppercase().toCharArray()) {})
         assertEquals("Current", repository.notes.value.single().title)
         backup.commit()
-        assertEquals(original, repository.notes.value.single()); assertEquals(SortOrder.ALPHABETICAL, repository.sort.value)
+        assertEquals(listOf(original, second), repository.notes.value)
         assertEquals(1, repository.attachments().size)
         repository.close(); repository.open(root.copyOf())
-        assertEquals(original.id, repository.notes.value.single().id)
-        assertTrue(backup.configured())
+        assertEquals(listOf(original.id, second.id), repository.notes.value.map(Note::id))
+        assertEquals(phrase, repository.passphrase())
+    }
+    @Test fun recoveryPassphraseOpensTheSameVaultWithoutTheDeviceKey() = runBlocking {
+        val note = Note(title = "Recoverable"); repository.save(note)
+        assertEquals(false, repository.passphraseConfirmed.value)
+        repository.confirmPassphrase(); assertEquals(true, repository.passphraseConfirmed.value)
+        repository.close()
+        assertThrows(Exception::class.java) { repository.recoverRoot(otherPhrase.toCharArray()) }
+        val recovered = repository.recoverRoot(phrase.toCharArray())
+        assertArrayEquals(root, recovered)
+        repository.open(recovered)
+        assertEquals(note, repository.notes.value.single())
+        assertTrue(repository.ensurePassphrase { error("Existing passphrase must be kept") })
+    }
+    @Test fun restoreAdoptsTheBackupPassphraseForRecovery(): Unit = runBlocking {
+        val note = Note(title = "From old phone"); repository.save(note)
+        val (encrypted, _) = backup.create({})!!; sources += encrypted
+        repository.access { repository.setPassphrase(it, otherPhrase, confirmed = false) }
+        assertEquals(false, repository.passphraseConfirmed.value)
+        try { backup.stage(source("old.ssnb", encrypted.readBytes()), otherPhrase.toCharArray()) {}; fail("Accepted another passphrase") } catch (_: Exception) { }
+        backup.stage(source("old.ssnb", encrypted.readBytes()), phrase.toCharArray()) {}
+        backup.commit()
+        assertEquals(phrase, repository.passphrase()); assertEquals(true, repository.passphraseConfirmed.value)
+        repository.close()
+        assertArrayEquals(root, repository.recoverRoot(phrase.toCharArray()))
+        assertThrows(Exception::class.java) { repository.recoverRoot(otherPhrase.toCharArray()) }
+    }
+    @Test fun manualOrderPersistsAndEditingDoesNotMoveNotes() = runBlocking {
+        val first = Note(title = "First"); val second = Note(title = "Second"); val third = Note(title = "Third")
+        listOf(first, second, third).forEach { repository.save(it) }
+        assertEquals(listOf(third, second, first), repository.notes.value)
+        repository.reorder(listOf(second.id, first.id, third.id))
+        repository.save(third.copy(title = "Edited", updatedAt = third.updatedAt + 1))
+        repository.close(); repository.open(root.copyOf())
+        assertEquals(listOf(second.id, first.id, third.id), repository.notes.value.map(Note::id))
+        repository.delete(first.id)
+        assertEquals(listOf(second.id, third.id), repository.notes.value.map(Note::id))
+        assertEquals(listOf(second.id, third.id), repository.access { it.noteOrder() })
+    }
+    @Test fun existingVaultConvertsLegacySortExactlyOnce() = runBlocking {
+        val z = Note(title = "Zebra"); val a = Note(title = "Apple")
+        repository.save(z); repository.save(a)
+        repository.access { it.setSort(SortOrder.ALPHABETICAL); it.dao.deleteSecret("note-order") }
+        repository.close(); repository.open(root.copyOf())
+        assertEquals(listOf(a, z), repository.notes.value)
+        repository.save(z.copy(title = "Aardvark", updatedAt = z.updatedAt + 1))
+        repository.close(); repository.open(root.copyOf())
+        assertEquals(listOf(a.id, z.id), repository.notes.value.map(Note::id))
+    }
+    @Test fun versionOneBackupRestoresItsOriginalSortAsManualOrder() = runBlocking {
+        val z = Note(title = "Zebra"); val a = Note(title = "Apple")
+        val manifest = dev.securenotes.backup.BackupManifest(version = 1, notes = listOf(z, a), attachments = emptyList(), sort = SortOrder.ALPHABETICAL)
+        val bytes = java.io.ByteArrayOutputStream()
+        dev.securenotes.backup.BackupCodec.encrypt(bytes, "legacy password".toCharArray()) { clear ->
+            val zip = java.util.zip.ZipOutputStream(clear)
+            zip.putNextEntry(java.util.zip.ZipEntry("manifest.json"))
+            zip.write(documentJson.encodeToString(dev.securenotes.backup.BackupManifest.serializer(), manifest).toByteArray())
+            zip.closeEntry(); zip.finish(); zip.flush()
+        }
+        assertEquals(2, backup.stage(source("legacy.ssnb", bytes.toByteArray()), "legacy password".toCharArray()) {})
+        backup.commit()
+        assertEquals(listOf(a, z), repository.notes.value)
     }
     @Test fun corruptRestoreDoesNotReplaceExistingNotesAndCancelledStageIsDiscarded() = runBlocking {
         val note = Note(title = "Preserve me"); repository.save(note)
-        backup.configure("password".toCharArray())
-        val file = backup.create("password".toCharArray()) {}; sources += file
+        val file = backup.create({})!!.first; sources += file
         val bytes = file.readBytes(); bytes[bytes.lastIndex] = (bytes.last().toInt() xor 1).toByte()
-        try { backup.stage(source("corrupt.ssnb", bytes), "password".toCharArray()) {}; fail("Accepted corrupt backup") } catch (_: Exception) { }
+        try { backup.stage(source("corrupt.ssnb", bytes), phrase.toCharArray()) {}; fail("Accepted corrupt backup") } catch (_: Exception) { }
         assertEquals(note, repository.notes.value.single()); assertNull(backup.pending)
-        backup.stage(source("valid.ssnb", file.readBytes()), "password".toCharArray()) {}
+        backup.stage(source("valid.ssnb", file.readBytes()), phrase.toCharArray()) {}
         backup.discard(); assertEquals(note, repository.notes.value.single())
     }
     @Test fun interruptedStagingAndOrphanFilesAreCleanedOnReopen() = runBlocking {
@@ -201,10 +265,10 @@ class StorageIntegrationTest {
         val note = Note(title = "Pending import"); repository.save(note)
         val uri = source("pending.txt", "Resumed searchable content".toByteArray())
         val id = newId()
-        repository.access { it.dao.putImport(dev.securenotes.storage.ImportRow(id, note.id, uri.toString(), "pending.txt", "text/plain", newId())) }
+        repository.access { it.dao.putImport(dev.securenotes.storage.ImportRow(id, note.id, uri.toString(), "pending.txt", "text/plain")) }
         repository.close(); repository.open(root.copyOf())
         while (repository.indexNext()) { }
-        assertEquals(1, repository.notes.value.single().document.blocks.count { it.isAttachment })
+        assertEquals(1, repository.notes.value.single().document.attachments.size)
         assertEquals(id, repository.attachments().values.single().id)
         assertEquals(note.id, repository.search("resumed").single().noteId)
         assertFalse(repository.indexNext())

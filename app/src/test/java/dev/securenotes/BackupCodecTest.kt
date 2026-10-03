@@ -44,12 +44,26 @@ class BackupCodecTest {
     }
     @Test fun `manifest rejects foreign references duplicates paths and unknown versions`() {
         val note = Note(title = "Hello")
-        BackupService.validate(BackupManifest(notes = listOf(note), attachments = emptyList(), sort = SortOrder.EDITED))
-        assertThrows(IllegalArgumentException::class.java) { BackupService.validate(BackupManifest(notes = listOf(note, note), attachments = emptyList(), sort = SortOrder.EDITED)) }
-        assertThrows(IllegalArgumentException::class.java) { BackupService.validate(BackupManifest(version = 2, notes = listOf(note), attachments = emptyList(), sort = SortOrder.EDITED)) }
+        BackupService.validate(BackupManifest(version = 1, notes = listOf(note), attachments = emptyList(), sort = SortOrder.EDITED))
+        BackupService.validate(BackupManifest(notes = listOf(note), attachments = emptyList(), order = listOf(note.id)))
+        assertThrows(IllegalArgumentException::class.java) { BackupService.validate(BackupManifest(version = 1, notes = listOf(note, note), attachments = emptyList(), sort = SortOrder.EDITED)) }
+        assertThrows(IllegalArgumentException::class.java) { BackupService.validate(BackupManifest(version = 3, notes = listOf(note), attachments = emptyList(), sort = SortOrder.EDITED)) }
         val id = newId()
-        val attached = note.copy(document = Document(blocks = listOf(Block(type = BlockType.FILE, attachmentId = id))))
-        assertThrows(IllegalArgumentException::class.java) { BackupService.validate(BackupManifest(notes = listOf(attached), attachments = listOf(AttachmentRow(id, newId(), "x", "text/plain", 1, "a".repeat(64))), sort = SortOrder.EDITED)) }
+        val attached = note.copy(document = Document(attachments = listOf(id)))
+        val owned = AttachmentRow(id, attached.id, "x", "text/plain", 1, "a".repeat(64))
+        BackupService.validate(BackupManifest(notes = listOf(attached), attachments = listOf(owned), order = listOf(attached.id)))
+        assertThrows(IllegalArgumentException::class.java) { BackupService.validate(BackupManifest(version = 1, notes = listOf(attached), attachments = listOf(owned.copy(noteId = newId())), sort = SortOrder.EDITED)) }
+        assertThrows(IllegalArgumentException::class.java) { BackupService.validate(BackupManifest(notes = listOf(note), attachments = listOf(owned), order = listOf(note.id))) }
+        val other = Note(title = "Other", document = Document(attachments = listOf(id)))
+        assertThrows(IllegalArgumentException::class.java) { BackupService.validate(BackupManifest(notes = listOf(attached, other), attachments = listOf(owned), order = listOf(attached.id, other.id))) }
+    }
+    @Test fun `manual backup order must contain every note exactly once`() {
+        val a = Note(title = "A"); val b = Note(title = "B")
+        val valid = BackupManifest(notes = listOf(a, b), attachments = emptyList(), order = listOf(b.id, a.id))
+        BackupService.validate(valid); assertEquals(listOf(b.id, a.id), valid.orderedIds())
+        for (order in listOf(null, emptyList(), listOf(a.id), listOf(a.id, a.id), listOf(a.id, newId()))) {
+            assertThrows(IllegalArgumentException::class.java) { BackupService.validate(valid.copy(order = order)) }
+        }
     }
     @Test fun `local authenticated envelope binds associated data`() {
         val key = Crypto.random(32); val data = "secret".toByteArray(); val aad = "generation".toByteArray()

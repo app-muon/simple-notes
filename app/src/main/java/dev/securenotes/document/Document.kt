@@ -8,27 +8,31 @@ fun newId(): String = UUID.randomUUID().toString()
 fun validId(value: String): Boolean = runCatching { UUID.fromString(value).toString() == value }.getOrDefault(false)
 val documentJson = Json { encodeDefaults = true; ignoreUnknownKeys = false }
 
-@Serializable enum class BlockType { PARAGRAPH, HEADING1, HEADING2, BULLET, NUMBERED, CHECKLIST, IMAGE, FILE }
-@Serializable data class BoldSpan(val start: Int, val end: Int)
-@Serializable data class Block(
-    val id: String = newId(),
-    val type: BlockType = BlockType.PARAGRAPH,
-    val text: String = "",
-    val bold: List<BoldSpan> = emptyList(),
-    val checked: Boolean = false,
-    val attachmentId: String? = null,
-) {
-    val isAttachment: Boolean get() = type == BlockType.IMAGE || type == BlockType.FILE
+@Serializable enum class LineType {
+    PARAGRAPH, HEADING1, HEADING2, BULLET, NUMBERED, CHECKLIST;
+    val isList: Boolean get() = this == BULLET || this == NUMBERED || this == CHECKLIST
 }
-@Serializable data class Document(val version: Int = 1, val blocks: List<Block> = listOf(Block())) {
+/** Formatting for one line of the body (text between newlines). */
+@Serializable data class Line(val type: LineType = LineType.PARAGRAPH, val checked: Boolean = false)
+/** Bold range in body character offsets, end exclusive. */
+@Serializable data class BoldSpan(val start: Int, val end: Int)
+/**
+ * A note body: one plain string, one [Line] per line of it, bold ranges, and the note's attachments in display order.
+ * Attachments live in their own section, never inside the text.
+ */
+@Serializable data class Document(
+    val version: Int = 2,
+    val text: String = "",
+    val lines: List<Line> = listOf(Line()),
+    val bold: List<BoldSpan> = emptyList(),
+    val attachments: List<String> = emptyList(),
+) {
     fun validate() {
-        require(version == 1) { "Unsupported document version" }
-        require(blocks.map { it.id }.distinct().size == blocks.size)
-        blocks.forEach { b ->
-            require(validId(b.id))
-            require(b.bold.all { it.start >= 0 && it.end > it.start && it.end <= b.text.length })
-            require(if (b.isAttachment) b.attachmentId?.let(::validId) == true else b.attachmentId == null)
-        }
+        require(version == 2) { "Unsupported document version" }
+        require(lines.size == text.count { it == '\n' } + 1) { "Line formats do not match the text" }
+        var previousEnd = 0
+        bold.forEach { require(it.start >= previousEnd && it.end > it.start && it.end <= text.length) { "Invalid bold range" }; previousEnd = it.end }
+        require(attachments.distinct().size == attachments.size && attachments.all(::validId))
     }
 }
 @Serializable data class Note(
@@ -36,7 +40,7 @@ val documentJson = Json { encodeDefaults = true; ignoreUnknownKeys = false }
     val createdAt: Long = System.currentTimeMillis(), val updatedAt: Long = createdAt,
 ) {
     val displayTitle: String get() = title.trim().ifEmpty { "Untitled" }
-    val isEmpty: Boolean get() = title.isBlank() && document.blocks.none { it.text.isNotBlank() || it.isAttachment }
+    val isEmpty: Boolean get() = title.isBlank() && document.text.isBlank() && document.attachments.isEmpty()
 }
 @Serializable enum class SortOrder(val label: String) {
     EDITED("Recently edited"), CREATED("Recently created"), ALPHABETICAL("Alphabetical")
@@ -51,13 +55,30 @@ fun sortedNotes(notes: List<Note>, order: SortOrder): List<Note> = when (order) 
 }
 
 /** Immutable snapshots deliberately live only in the active editing session. */
-class EditHistory {
+class EditHistory(private val now: () -> Long = { System.nanoTime() / 1_000_000 }) {
     private val undo = ArrayDeque<Note>()
     private val redo = ArrayDeque<Note>()
+    private var lastTypingAt: Long? = null
     val canUndo get() = undo.isNotEmpty()
     val canRedo get() = redo.isNotEmpty()
-    fun record(note: Note) { undo.addLast(note); redo.clear(); if (undo.size > 100) undo.removeFirst() }
-    fun undo(current: Note): Note? = if (undo.isEmpty()) null else undo.removeLast().also { redo.addLast(current) }
-    fun redo(current: Note): Note? = if (redo.isEmpty()) null else redo.removeLast().also { undo.addLast(current) }
-    fun clear() { undo.clear(); redo.clear() }
+    /** Consecutive typing shares one undo step until a pause or a history/session boundary. */
+    fun record(note: Note, typing: Boolean = false) {
+        val time = now()
+        val previous = lastTypingAt
+        if (!typing || previous == null || time - previous > 1_000 || redo.isNotEmpty()) {
+            undo.addLast(note)
+            if (undo.size > 100) undo.removeFirst()
+        }
+        redo.clear()
+        lastTypingAt = if (typing) time else null
+    }
+    fun undo(current: Note): Note? {
+        lastTypingAt = null
+        return if (undo.isEmpty()) null else undo.removeLast().also { redo.addLast(current) }
+    }
+    fun redo(current: Note): Note? {
+        lastTypingAt = null
+        return if (redo.isEmpty()) null else redo.removeLast().also { undo.addLast(current) }
+    }
+    fun clear() { undo.clear(); redo.clear(); lastTypingAt = null }
 }
