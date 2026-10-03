@@ -15,6 +15,8 @@ The signed APK below has not been rebuilt for these source changes; its checksum
 
 After the display name and in-app text were changed to **Notes**, debug assembly, instrumentation-test compilation, and debug lint passed again. APK metadata confirms `application-label:'Notes'`. The unit and instrumentation suites above ran before this text-only rename and were not rerun for it.
 
+After adding scrollbars to overflowing lists, notes, settings, recovery screens, and the formatting toolbar, debug assembly and lint passed (0 errors, 7 warnings), and all 18 UI tests passed again on the disposable Pixel 8 emulator. That UI run includes the renamed app. The transcript is `%TEMP%\notes-scrollbars-build\scrollbar-ui-tests.txt`; APKs and the lint report are under that build directory's `app/outputs/apk` and `app/reports`. These drawing/layout changes did not require rerunning the unchanged unit or storage suites. Physical checks of scrollbar appearance in both themes and at large font sizes remain in the acceptance checklist.
+
 ## Archived signed build: 1.0.1 (2)
 
 The earlier deliverable is `dist/SecureNotes-1.0.1.apk`, version 1.0.1 (2), minimum Android 15 / API 35, targeting API 37. It contains ARM64 and x86_64 native libraries. Its in-place upgrade from 1.0.0 retained notes. That build's database schema and backup format remain version 1.

@@ -59,8 +59,9 @@ private val wordKeyboard = KeyboardOptions(capitalization = KeyboardCapitalizati
     var checking by remember(words) { mutableStateOf(false) }
     val positions = remember(words) { words.indices.shuffled(SecureRandom()).take(3).sorted() }
     val answers = remember(words) { mutableStateListOf("", "", "") }
+    val scroll = rememberScrollState()
     Scaffold(topBar = { TopAppBar(title = { Text("Recovery passphrase") }) }) { padding ->
-        Column(Modifier.padding(padding).verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        Column(Modifier.padding(padding).verticalScrollbar(scroll).verticalScroll(scroll).padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             if (!checking) {
                 Text("Write these ${words.size} words down in order, or copy them into your password manager, and keep them somewhere safe. They are the only way to open your notes on a new phone, or on this phone if its unlock key is lost. They also encrypt your backups.")
                 WordGrid(words)
@@ -82,8 +83,9 @@ private val wordKeyboard = KeyboardOptions(capitalization = KeyboardCapitalizati
 }
 
 @Composable fun RevealPassphraseDialog(words: List<String>, dismiss: () -> Unit) {
+    val scroll = rememberScrollState()
     AlertDialog(onDismissRequest = dismiss, properties = secureDialog, title = { Text("Recovery passphrase") }, text = {
-        Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        Column(Modifier.verticalScrollbar(scroll).verticalScroll(scroll).padding(end = 12.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             WordGrid(words)
             CopyWordsButton(words)
             Text("These words open your notes and backups on any phone. Never share them.", color = MaterialTheme.colorScheme.error)
@@ -94,10 +96,11 @@ private val wordKeyboard = KeyboardOptions(capitalization = KeyboardCapitalizati
 /** Entry for an existing passphrase: same-device recovery, or the passphrase that encrypted a backup. */
 @Composable fun PassphraseDialog(wordlist: Set<String>, title: String, message: String, confirmLabel: String, dismiss: () -> Unit, submit: (CharArray) -> Unit) {
     var text by remember { mutableStateOf("") }
+    val scroll = rememberScrollState()
     val entered = Passphrase.words(text)
     val unknown = Passphrase.unknownWords(text, wordlist)
     AlertDialog(onDismissRequest = { text = ""; dismiss() }, properties = secureDialog, title = { Text(title) }, text = {
-        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Column(Modifier.verticalScrollbar(scroll).verticalScroll(scroll).padding(end = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text(message)
             OutlinedTextField(text, { text = it }, Modifier.fillMaxWidth(), label = { Text("Recovery passphrase") }, minLines = 2, keyboardOptions = wordKeyboard,
                 supportingText = { Text(if (unknown.isNotEmpty()) "Not in the word list: ${unknown.joinToString(", ")}" else "${entered.size} of ${Passphrase.WORDS} words") },

@@ -223,7 +223,7 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
                 vm.listAnchor = all.getOrNull(state.firstVisibleItemIndex)?.id; vm.listOffset = state.firstVisibleItemScrollOffset
                 vm.open(note)
             }, onReorder = vm::reorderNotes)
-            else LazyColumn(state = state, contentPadding = PaddingValues(bottom = 96.dp)) {
+            else LazyColumn(state = state, modifier = Modifier.weight(1f).verticalScrollbar(state), contentPadding = PaddingValues(bottom = 96.dp)) {
                 items(filtered, key = { it.id }) { note ->
                     Column(Modifier.fillMaxWidth().clickable {
                         vm.listAnchor = filtered.getOrNull(state.firstVisibleItemIndex)?.id; vm.listOffset = state.firstVisibleItemScrollOffset
@@ -238,11 +238,12 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
 
 @Composable private fun SearchScreen(vm: NotesViewModel, back: () -> Unit) {
     val all by vm.repository.notes.collectAsStateWithLifecycle()
+    val state = rememberLazyListState()
     Scaffold(topBar = { TopAppBar(title = { Text("Search") }, navigationIcon = { BackButton(back) }) }) { padding ->
         Column(Modifier.padding(padding)) {
             OutlinedTextField(vm.query, vm::search, Modifier.fillMaxWidth().padding(16.dp), label = { Text("Search notes and attachments") }, singleLine = true, leadingIcon = { Icon(Icons.Default.Search, null) })
             if (vm.query.isNotBlank() && vm.results.isEmpty()) Text("No matching notes", Modifier.padding(24.dp))
-            LazyColumn { items(vm.results, key = { it.noteId }) { hit ->
+            LazyColumn(state = state, modifier = Modifier.weight(1f).verticalScrollbar(state)) { items(vm.results, key = { it.noteId }) { hit ->
                 Column(Modifier.fillMaxWidth().clickable { all.firstOrNull { it.id == hit.noteId }?.let { vm.open(it, hit) } }.padding(24.dp)) {
                     Text(hit.title, style = MaterialTheme.typography.titleMedium)
                     Spacer(Modifier.height(6.dp)); Text(hit.snippet, maxLines = 3, overflow = TextOverflow.Ellipsis)
@@ -298,7 +299,7 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
             DropdownMenu(menu, { menu = false }) { DropdownMenuItem(text = { Text("Delete") }, leadingIcon = { Icon(Icons.Default.DeleteOutline, null) }, onClick = { menu = false; delete = true }) }
         }
     }) }, bottomBar = { if (vm.editing) EditorToolbar(vm, editor, selectionRevision) }) { padding ->
-        Column(Modifier.fillMaxSize().padding(padding).verticalScroll(scroll).onGloballyPositioned { content = it }
+        Column(Modifier.fillMaxSize().padding(padding).verticalScrollbar(scroll).verticalScroll(scroll).onGloballyPositioned { content = it }
             .padding(start = 24.dp, end = 24.dp, bottom = 100.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             if (vm.editing) {
                 OutlinedTextField(note.title, { vm.change(note.copy(title = it), typing = true) }, modifier = Modifier.fillMaxWidth().focusRequester(titleFocus),
@@ -361,6 +362,7 @@ private fun annotatedLine(document: Document, start: Int, end: Int, match: dev.s
 
 /** Formatting toggles act on every line in the editor's selection and show the current line's format. */
 @Composable private fun EditorToolbar(vm: NotesViewModel, editor: BodyEditText?, selectionRevision: Int) {
+    val scroll = rememberScrollState()
     val revision = vm.historyRevision
     val active = remember(editor, selectionRevision, revision) { editor?.activeType() }
     val bold = remember(editor, selectionRevision, revision) { editor?.isBold() == true }
@@ -370,7 +372,7 @@ private fun annotatedLine(document: Document, start: Int, end: Int, match: dev.s
         }
     }
     Surface(tonalElevation = 3.dp) {
-        Row(Modifier.fillMaxWidth().navigationBarsPadding().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.fillMaxWidth().navigationBarsPadding().horizontalScrollbar(scroll).horizontalScroll(scroll).padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = vm::undo, enabled = revision >= 0 && vm.history.canUndo) { Icon(Icons.AutoMirrored.Filled.Undo, "Undo") }
             IconButton(onClick = vm::redo, enabled = vm.history.canRedo) { Icon(Icons.AutoMirrored.Filled.Redo, "Redo") }
             IconToggleButton(checked = bold, onCheckedChange = { editor?.toggleBold() }, enabled = editor != null) { Icon(Icons.Default.FormatBold, "Bold") }
@@ -452,8 +454,9 @@ private fun annotatedLine(document: Document, start: Int, end: Int, match: dev.s
 
 @Composable private fun SettingsScreen(vm: NotesViewModel, back: () -> Unit, reveal: () -> Unit, restore: () -> Unit, chooseBackup: () -> Unit) {
     val status by vm.app.autoBackup.status.collectAsStateWithLifecycle()
+    val scroll = rememberScrollState()
     Scaffold(topBar = { TopAppBar(title = { Text("Settings") }, navigationIcon = { BackButton(back) }) }) { padding ->
-        Column(Modifier.padding(padding).verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Column(Modifier.padding(padding).verticalScrollbar(scroll).verticalScroll(scroll).padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("Recovery passphrase", style = MaterialTheme.typography.titleLarge)
             Text("Your ${dev.securenotes.security.Passphrase.WORDS}-word passphrase opens your notes on a new phone and encrypts your backups.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             OutlinedButton(onClick = reveal, modifier = Modifier.fillMaxWidth()) { Text("View recovery passphrase") }

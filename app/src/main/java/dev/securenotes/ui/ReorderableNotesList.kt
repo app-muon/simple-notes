@@ -70,7 +70,7 @@ internal fun ReorderableNotesList(
             if (amount != 0f) { state.scrollBy(amount); moveAtPointer() }
         }
     }
-    Box(Modifier.fillMaxSize().clipToBounds().pointerInput(state) {
+    Box(Modifier.fillMaxSize().clipToBounds().verticalScrollbar(state).pointerInput(state) {
         detectDragGesturesAfterLongPress(
             onDragStart = { point ->
                 if (!saving) state.layoutInfo.visibleItemsInfo.firstOrNull { point.y >= it.offset && point.y < it.offset + it.size }?.let {
