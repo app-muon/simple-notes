@@ -113,6 +113,6 @@ internal fun ReorderableNotesList(
 }
 
 @Composable private fun NoteTitle(note: Note, modifier: Modifier = Modifier) {
-    Text(note.displayTitle, modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 22.dp),
+    Text(note.displayTitle, modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp),
         style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
 }

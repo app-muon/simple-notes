@@ -240,7 +240,7 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
                     Column(Modifier.fillMaxWidth().clickable {
                         vm.listAnchor = filtered.getOrNull(state.firstVisibleItemIndex)?.id; vm.listOffset = state.firstVisibleItemScrollOffset
                         if (vm.choosingDestination) vm.acceptShare(note) else vm.open(note)
-                    }.padding(horizontal = 24.dp, vertical = 22.dp)) { Text(note.displayTitle, style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis) }
+                    }.padding(horizontal = 24.dp, vertical = 12.dp)) { Text(note.displayTitle, style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis) }
                     HorizontalDivider(Modifier.padding(horizontal = 24.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .5f))
                 }
             }
