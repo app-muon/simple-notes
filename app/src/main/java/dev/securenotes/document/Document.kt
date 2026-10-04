@@ -38,6 +38,7 @@ val documentJson = Json { encodeDefaults = true; ignoreUnknownKeys = false }
 @Serializable data class Note(
     val id: String = newId(), val title: String = "", val document: Document = Document(),
     val createdAt: Long = System.currentTimeMillis(), val updatedAt: Long = createdAt,
+    val tagIds: List<String> = emptyList(),
 ) {
     val displayTitle: String get() = title.trim().ifEmpty { "Untitled" }
     val isEmpty: Boolean get() = title.isBlank() && document.text.isBlank() && document.attachments.isEmpty()
@@ -61,6 +62,7 @@ class EditHistory(private val now: () -> Long = { System.nanoTime() / 1_000_000 
     private var lastTypingAt: Long? = null
     val canUndo get() = undo.isNotEmpty()
     val canRedo get() = redo.isNotEmpty()
+    fun hasTagsOutside(ids: Set<String>) = (undo.asSequence() + redo.asSequence()).any { note -> note.tagIds.any { it !in ids } }
     /** Consecutive typing shares one undo step until a pause or a history/session boundary. */
     fun record(note: Note, typing: Boolean = false) {
         val time = now()

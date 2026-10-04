@@ -35,6 +35,91 @@ class StorageIntegrationTest {
         backup = BackupService(context, repository) {}
     }
     private val phrase = "cherisher driven greedily motion pyramid skipping unbundle vertigo"
+    @Test fun daoTagConflictsAbortWithoutReplacingRows(): Unit = runBlocking {
+        val first = repository.createTag("First"); val second = repository.createTag("Second")
+        val revision = repository.changes.value
+        repository.access { v ->
+            val before = v.dao.tags()
+            for (row in listOf(dev.securenotes.storage.TagRow.of(Tag(name = "FIRST")), dev.securenotes.storage.TagRow.of(first.copy(name = "Third")))) {
+                try { v.dao.insertTag(row); fail("Conflicting insert succeeded") } catch (_: Exception) { }
+                assertEquals(before, v.dao.tags())
+            }
+            try { v.dao.updateTag(dev.securenotes.storage.TagRow.of(second.copy(name = "First"))); fail("Conflicting rename succeeded") } catch (_: Exception) { }
+            assertEquals(before, v.dao.tags())
+            assertEquals(0, v.dao.updateTag(dev.securenotes.storage.TagRow.of(Tag(name = "Missing"))))
+        }
+        try { repository.createTag("first"); fail("Duplicate created") } catch (_: IllegalArgumentException) { }
+        try { repository.renameTag(second.id, "first"); fail("Duplicate renamed") } catch (_: IllegalArgumentException) { }
+        assertEquals(revision, repository.changes.value)
+        assertEquals(listOf(first, second), repository.tags.value)
+        repository.close(); repository.open(root.copyOf())
+        assertEquals(listOf(first, second), repository.tags.value)
+    }
+    @Test fun tagsPersistFilterSearchAndPreserveHiddenOrder(): Unit = runBlocking {
+        val tag = repository.createTag("  Work  "); val other = repository.createTag("Other")
+        val notes = listOf(Note(title = "A needle", tagIds = listOf(tag.id, other.id)), Note(title = "x needle"),
+            Note(title = "B needle", tagIds = listOf(tag.id)), Note(title = "y needle"), Note(title = "C needle", tagIds = listOf(tag.id)))
+        notes.reversed().forEach { repository.save(it) }
+        assertEquals(3, repository.search("needle", NoteFilter(tagId = tag.id)).size)
+        assertEquals(2, repository.search("needle", NoteFilter(untagged = true)).size)
+        repository.reorderVisible(listOf(notes[4].id, notes[0].id, notes[2].id))
+        assertEquals(listOf(notes[4], notes[1], notes[0], notes[3], notes[2]), repository.notes.value)
+        repository.renameTag(tag.id, "WORK")
+        try { repository.renameTag(other.id, "work"); fail("Accepted duplicate name") } catch (_: IllegalArgumentException) { }
+        repository.close(); assertTrue(repository.tags.value.isEmpty())
+        repository.open(root.copyOf())
+        assertEquals("WORK", repository.tags.value.first { it.id == tag.id }.name)
+        assertEquals(listOf(tag.id, other.id), repository.notes.value.first { it.id == notes[0].id }.tagIds)
+        repository.enqueue(notes[0].copy(title = "Pending edit", updatedAt = notes[0].updatedAt + 1))
+        repository.deleteTag(tag.id)
+        assertEquals(5, repository.notes.value.size)
+        assertEquals("Pending edit", repository.notes.value.first { it.id == notes[0].id }.title)
+        assertTrue(repository.notes.value.none { tag.id in it.tagIds })
+        assertEquals(listOf(other.id), repository.notes.value.first { it.id == notes[0].id }.tagIds)
+        repository.save(notes[0].copy(title = "Stale assignments", updatedAt = notes[0].updatedAt + 2))
+        assertEquals(listOf(other.id), repository.notes.value.first { it.id == notes[0].id }.tagIds)
+        val order = repository.notes.value.map(Note::id)
+        for (invalid in listOf(listOf(order[0], order[0]), listOf(newId()))) {
+            try { repository.reorderVisible(invalid); fail("Invalid order accepted") } catch (_: IllegalArgumentException) { }
+            assertEquals(order, repository.notes.value.map(Note::id))
+        }
+    }
+    @Test fun tagBackupsIncludeUnusedDefinitionsAndMetadataChanges(): Unit = runBlocking {
+        val first = backup.create({})!!; sources += first.first
+        val tag = repository.createTag("Personal"); val unused = repository.createTag("Unused")
+        val note = Note(title = "Tagged", tagIds = listOf(tag.id)); repository.save(note)
+        val revision = repository.changes.value
+        repository.renameTag(unused.id, "Still unused")
+        assertTrue(repository.changes.value > revision)
+        val second = backup.create({}, first.second)!!; sources += second.first
+        assertNotEquals(first.second, second.second)
+        assertNull(backup.create({}, second.second))
+        repository.deleteTag(tag.id)
+        backup.stage(source("tags.ssnb", second.first.readBytes()), phrase.toCharArray()) {}
+        backup.commit()
+        assertEquals(note, repository.notes.value.single())
+        assertEquals(setOf("Personal", "Still unused"), repository.tags.value.map { it.name }.toSet())
+    }
+    @Test fun additiveMigrationRetainsVersionOneNotesOrderAndSearch(): Unit = runBlocking {
+        val note = Note(title = "Migration needle", document = Document(text = "Existing body", bold = listOf(BoldSpan(0, 8))))
+        repository.save(note)
+        // Recreate the exported v1 schema in this synthetic SQLCipher vault, including its identity hash.
+        repository.access { v ->
+            val db = v.database.openHelper.writableDatabase
+            db.execSQL("ALTER TABLE notes DROP COLUMN tagIds")
+            db.execSQL("DROP TABLE tags")
+            db.execSQL("UPDATE room_master_table SET identity_hash = '6cd01fd6d9b0fb2e4614552389bf5a07' WHERE id = 42")
+            db.execSQL("PRAGMA user_version = 1")
+        }
+        repository.close(); repository.open(root.copyOf())
+        assertEquals(note, repository.notes.value.single())
+        assertTrue(repository.tags.value.isEmpty())
+        assertEquals(note.id, repository.search("needle").single().noteId)
+        val tag = repository.createTag("After upgrade")
+        repository.save(note.copy(tagIds = listOf(tag.id)))
+        repository.close(); repository.open(root.copyOf())
+        assertEquals(listOf(tag.id), repository.notes.value.single().tagIds)
+    }
     private val otherPhrase = "vertigo unbundle skipping pyramid motion greedily driven cherisher"
     @After fun cleanup() = runBlocking {
         if (::backup.isInitialized) backup.discard()
@@ -168,7 +253,7 @@ class StorageIntegrationTest {
     @Test fun backupRestoresAllContentAndSettingsOnlyAfterCommit() = runBlocking {
         val original = repository.import(Note(title = "Original"), source("attachment.txt", "Keep this".toByteArray()))
         val second = Note(title = "Second"); repository.save(second)
-        repository.reorder(listOf(original.id, second.id))
+        repository.reorderVisible(listOf(original.id, second.id))
         val (encrypted, fingerprint) = backup.create({})!!
         sources += encrypted
         assertNull(backup.create({}, unchangedSince = fingerprint))
@@ -212,7 +297,7 @@ class StorageIntegrationTest {
         val first = Note(title = "First"); val second = Note(title = "Second"); val third = Note(title = "Third")
         listOf(first, second, third).forEach { repository.save(it) }
         assertEquals(listOf(third, second, first), repository.notes.value)
-        repository.reorder(listOf(second.id, first.id, third.id))
+        repository.reorderVisible(listOf(second.id, first.id, third.id))
         repository.save(third.copy(title = "Edited", updatedAt = third.updatedAt + 1))
         repository.close(); repository.open(root.copyOf())
         assertEquals(listOf(second.id, first.id, third.id), repository.notes.value.map(Note::id))

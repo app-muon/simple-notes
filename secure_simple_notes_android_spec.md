@@ -47,7 +47,7 @@ supported document attachments.
 3.  **Simple UI**
     -   Main screen is a single list of notes.
     -   No folders.
-    -   No tags.
+    -   Reusable tags with multiple assignments per note and one active filter.
     -   No pinned notes.
     -   No bulk selection.
     -   Avoid unnecessary buttons and persistent toolbars.
@@ -110,7 +110,7 @@ Primary destinations:
 4.  **Settings**
 5.  **Backup / Restore flows**
 
-There is no folder/tag navigation and no Trash screen.
+The compact list title selects All notes, Untagged, or one tag. There is no folder navigation or Trash screen.
 
 ------------------------------------------------------------------------
 
@@ -180,7 +180,7 @@ Do not display:
 -   body preview;
 -   last-edited timestamp;
 -   attachment count;
--   tags;
+-   nested tag hierarchies;
 -   folders;
 -   word count.
 
@@ -495,9 +495,27 @@ If a match came from text extracted from an attachment:
 
 Do not automatically open the external attachment viewer.
 
-### 11.5 No separate Find-in-Note
+### 11.5 Find in note
 
-Do not implement a dedicated "Find in current note" feature.
+The note toolbar opens Find in both reading and editing modes. Match literal substrings in title then body, ignoring case and accents, with original UTF-16 ranges preserved for combining characters and emoji. Include partial words, phrases, punctuation, and line breaks; exclude tags, attachment contents, and filenames. No fuzzy matching, regular expressions, or replacement.
+
+Show a query field, Previous/Next, an active/total counter, and Close. Highlight every match and distinguish the active result. Navigation wraps, scrolls the actual wrapped text row into view, and retains find-field focus. While computing, leave the counter blank and disable navigation; show “No matches” only after completion. Retain highlights during query-only changes, invalidate them when source text changes, and clear them immediately for an empty query. Publish only results for the current query/document generation, retaining the active match when possible and otherwise clamping its index. Debounce computation by 150 ms, cancel outdated work, and recompute on typing, paste, undo, and redo without scrolling on ordinary edits. Highlights are temporary UI styling, never saved formatting or undo steps.
+
+Back closes Find before leaving editing, then returns to the list. Done closes Find without restoring focus, hides the keyboard, and finishes the existing save/discard flow in one action; save failure retains an editable note. Closing clears query/results. The latest explicit action wins: use the active result only if the user has not edited or moved the cursor since changing the query or pressing Previous/Next. Otherwise preserve the latest editor field and selection, including ranges. With no result, restore a saved selection only while applicable. An immediate Close resolves pending results off the main thread without the debounce; further input, reopening Find, switching notes, or locking invalidates the restoration. Only explicit Find actions request scrolling; entering editing must not retrigger it.
+
+Reading mode uses the trimmed display title, mapping original offsets through its removed prefix and clipping highlights to visible characters. Never highlight the synthetic “Untitled” placeholder. Group body matches once per result/text revision, including multiline matches and their global active indices. Cache immutable normalized title and body preparations independently, preserving original UTF-16 offsets and cooperative cancellation. Clear prepared text and pending work on Close, note changes, and lock. Opening a global search result continues to jump to that result without opening Find; checklist results bring the whole row into view, while Find uses text geometry inside wrapped paragraphs.
+
+Tag assignments and tag-only undo/redo must not override Find's cursor destination. Track text/formatting history replay and reading-mode checkbox edits as editor interactions even when no field callback runs. For Find on a checklist's first visual line, use the row's top to avoid clipping the checkbox; for later wrapped lines, retain the match's text geometry. Pending-search highlight invalidation after text changes remains as specified above.
+
+### 11.5.1 Tags and filtered lists
+
+Keep list rows as titles only and use the existing compact toolbar title as a selector showing Notes, the selected tag, or Untagged. Its sheet contains All notes, Untagged, alphabetically listed tags, and Manage tags. Notes can carry multiple tags; show them beneath the title and edit assignments through the Tags menu and autosave flow. The checkbox picker can also create tags.
+
+Manage tags supports creation, global renaming, and confirmed deletion. Trim and collapse whitespace; enforce case-insensitive uniqueness while retaining display capitalization. Reject empty names and conflicting renames. Deletion removes assignments without deleting notes; unused definitions remain available. A draft created under a tag filter inherits that tag; All notes and Untagged create untagged drafts. Tags alone never retain an empty draft.
+
+Global search keeps its ranking and matching behavior within the selected filter. Navigation preserves the filter; locking and a fresh process reset it, and deleting the selected tag resets it to All notes. Share destinations continue to include all notes. Filtered dragging and accessible Move up/down replace only visible notes’ global slots: [A, x, B, y, C] reordered as C, A, B becomes [C, x, A, y, B].
+
+Persist stable tag IDs/names and default-empty note tag IDs in SQLCipher using Room schema 2 and an additive 1→2 migration. No historical block-document conversion is included. Creation uses abort-on-conflict insertion; renaming uses an update whose affected-row count must be one. Keep friendly validation, and publish catalog/backup changes only after successful writes. Reuse validated tag ID sets within serialized saves/imports and use the validated manifest IDs during restore. Flush pending edits before transactional global deletion; stale snapshots must not restore deleted assignments. Expose the repository catalog as a read-only, lock-aware projection. Reconcile deleted assignments, the selected filter, and affected undo history centrally. Use the same subset-order operation for full and filtered lists. Include tag changes in backup notifications and fingerprints. Manifest 3 carries definitions and assignments; supported tagless manifests restore untagged. Reject duplicate IDs/names and dangling references before replacement. Clear exposed tag state on locking; add no network access.
 
 ### 11.6 Search indexing privacy
 
@@ -899,7 +917,6 @@ changed:
 -   Collaboration
 -   Shared notebooks
 -   Folders
--   Tags
 -   Pinned/favorite notes
 -   Reminders
 -   Notifications for notes
@@ -912,7 +929,6 @@ changed:
 -   Calendar integration
 -   Word count
 -   Character count
--   Find-in-current-note
 -   Note duplication
 -   Bulk selection/actions
 -   Swipe actions
@@ -1286,7 +1302,7 @@ This specification incorporates the chosen behavior:
 -   Screenshots allowed
 -   Rich formatting + checklists + images + files
 -   Single notes list
--   No folders/tags/pinning
+-   Reusable tags; no folders or pinning
 -   Configurable sorting
 -   Permanent deletion
 -   No reminders
@@ -1337,7 +1353,7 @@ This specification incorporates the chosen behavior:
 -   Existing notes initially open in reading mode
 -   Editing controls hidden during reading
 -   Back exits editing before leaving note
--   No Find-in-note
+-   Find in note while reading and editing
 -   Search result snippets
 -   Search navigates to/highlights matching text
 -   Attachment search highlights containing attachment

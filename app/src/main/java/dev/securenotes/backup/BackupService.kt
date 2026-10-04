@@ -16,8 +16,9 @@ import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
 @Serializable data class BackupManifest(
-    val version: Int = 2, val notes: List<Note>, val attachments: List<AttachmentRow>,
+    val version: Int = 3, val notes: List<Note>, val attachments: List<AttachmentRow>,
     val sort: SortOrder? = null, val order: List<String>? = null,
+    val tags: List<Tag> = emptyList(),
 ) {
     fun orderedIds(): List<String> = if (version == 1) sortedNotes(notes, checkNotNull(sort)).map(Note::id) else checkNotNull(order)
 }
@@ -39,7 +40,7 @@ class BackupService(private val context: Context, private val repository: NotesR
         val notes = v.orderedNotes()
         val ids = notes.flatMap { it.document.attachments }.toSet()
         val attachments = v.dao.attachments().filter { it.id in ids }
-        val manifest = BackupManifest(notes = notes, attachments = attachments.map { it.copy(indexed = false, nextPage = 0) }, order = notes.map(Note::id))
+        val manifest = BackupManifest(notes = notes, attachments = attachments.map { it.copy(indexed = false, nextPage = 0) }, order = notes.map(Note::id), tags = v.dao.tags().map { it.decode() })
         val manifestBytes = documentJson.encodeToString(manifest).toByteArray()
         val fingerprint = Crypto.hash(manifestBytes).hex()
         if (fingerprint == unchangedSince) return@access null
@@ -98,8 +99,10 @@ class BackupService(private val context: Context, private val repository: NotesR
                 }
             }
             val data = checkNotNull(manifest)
+            val validTags = data.tags.map { it.id }.toSet()
+            data.tags.forEach { staged.dao.insertTag(TagRow.of(it)) }
             data.attachments.forEach { staged.dao.putAttachment(it.copy(indexed = false, nextPage = 0)) }
-            data.notes.forEach { repository.saveIn(staged, it) }
+            data.notes.forEach { repository.saveIn(staged, it, validTags) }
             staged.setNoteOrder(data.orderedIds())
             // The user just typed this passphrase, so it counts as confirmed.
             repository.setPassphrase(staged, canonical, confirmed = true)
@@ -132,7 +135,12 @@ class BackupService(private val context: Context, private val repository: NotesR
             return out.toByteArray()
         }
         fun validate(data: BackupManifest) {
-            require(data.version in 1..2)
+            require(data.version in 1..3)
+            if (data.version < 3) require(data.tags.isEmpty() && data.notes.all { it.tagIds.isEmpty() })
+            require(data.tags.map { it.id }.distinct().size == data.tags.size)
+            require(data.tags.map { tagKey(it.name) }.distinct().size == data.tags.size)
+            data.tags.forEach { require(validId(it.id) && it.name.isNotEmpty() && tagName(it.name) == it.name) }
+            val tagIds = data.tags.map { it.id }.toSet()
             if (data.version == 1) require(data.sort != null)
             else require(data.order != null && data.order.size == data.notes.size && data.order.toSet() == data.notes.map(Note::id).toSet())
             require(data.notes.map { it.id }.distinct().size == data.notes.size)
@@ -141,6 +149,7 @@ class BackupService(private val context: Context, private val repository: NotesR
             val referenced = mutableSetOf<String>()
             data.notes.forEach { note ->
                 require(validId(note.id)); note.document.validate()
+                require(note.tagIds.distinct().size == note.tagIds.size && tagIds.containsAll(note.tagIds))
                 note.document.attachments.forEach { id ->
                     require(attachments[id]?.noteId == note.id && referenced.add(id))
                 }

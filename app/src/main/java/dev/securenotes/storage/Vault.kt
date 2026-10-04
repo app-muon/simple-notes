@@ -46,6 +46,7 @@ class Vault(val context: Context, val directory: File, root: ByteArray, val chec
     private val dbKey = Crypto.subkey(root, "database:$id")
     val database: NotesDatabase = Room.databaseBuilder(context, NotesDatabase::class.java, File(directory, "notes.db").absolutePath)
         .openHelperFactory(SupportOpenHelperFactory(dbKey.copyOf()))
+        .addMigrations(MIGRATION_1_2)
         .addCallback(object : androidx.room.RoomDatabase.Callback() {
             override fun onOpen(db: androidx.sqlite.db.SupportSQLiteDatabase) {
                 db.query("PRAGMA temp_store=MEMORY").use { it.moveToFirst() }

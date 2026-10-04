@@ -9,6 +9,7 @@ import dev.securenotes.document.*
 import dev.securenotes.search.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
@@ -18,6 +19,8 @@ import kotlinx.serialization.encodeToString
 
 class NotesRepository(private val context: Context, private val checkAccess: () -> Unit) {
     val notes = MutableStateFlow<List<Note>>(emptyList())
+    private val storedTags = MutableStateFlow<List<Tag>>(emptyList())
+    val tags = storedTags.asStateFlow()
     val issue = MutableStateFlow<String?>(null)
     /** Bumped after every committed content change; drives automatic backup. */
     val changes = MutableStateFlow(0L)
@@ -49,6 +52,7 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
             opened.orderedNotes() // Capture the legacy display order before replaying pending edits.
             recoverEdits(opened)
             notes.value = opened.orderedNotes()
+            storedTags.value = opened.dao.tags().map { it.decode() }
             if (!active.exists()) atomicWrite(active, id.toByteArray())
             cleanupGenerations(id)
             garbageCollect(opened)
@@ -74,7 +78,7 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
                 }
             } finally {
                 pending.clear(); current?.close(); vault = null
-                root?.fill(0); root = null; notes.value = emptyList(); passphraseConfirmed.value = null
+                root?.fill(0); root = null; notes.value = emptyList(); storedTags.value = emptyList(); passphraseConfirmed.value = null
             }
         } }
     }
@@ -139,17 +143,21 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
         v.dao.putSecret(SecretRow("passphrase-confirmed", byteArrayOf(1))); passphraseConfirmed.value = true
     }
     suspend fun save(note: Note, preserveEmpty: Boolean = false) = access { v -> saveSnapshot(v, note, preserveEmpty) }
-    private suspend fun saveSnapshot(v: Vault, note: Note, preserveEmpty: Boolean) {
+    private suspend fun saveSnapshot(v: Vault, snapshot: Note, preserveEmpty: Boolean) {
+        // A queued snapshot or undo may predate global tag deletion. Never resurrect that assignment.
+        val validTags = v.dao.tags().map { it.id }.toSet()
+        val note = snapshot.copy(tagIds = snapshot.tagIds.filter { it in validTags }.distinct())
         note.document.validate()
         val existing = v.dao.note(note.id)
         if (existing != null && existing.updatedAt > note.updatedAt) return
         if (note.isEmpty && existing == null && !preserveEmpty) return
-        v.database.withTransaction { saveIn(v, note) }
+        v.database.withTransaction { saveIn(v, note, validTags) }
         changes.value++
         notes.value = if (notes.value.any { it.id == note.id }) notes.value.map { if (it.id == note.id) note else it }
             else listOf(note) + notes.value
     }
-    suspend fun saveIn(v: Vault, note: Note) {
+    suspend fun saveIn(v: Vault, note: Note, validTagIds: Set<String>) {
+        require(note.tagIds.distinct().size == note.tagIds.size && validTagIds.containsAll(note.tagIds))
         if (v.dao.note(note.id) == null) {
             val order = v.noteOrder() ?: v.orderedNotes().map(Note::id)
             v.setNoteOrder(listOf(note.id) + order.filterNot { it == note.id })
@@ -174,14 +182,32 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
         }
     }
     private suspend fun removeSource(v: Vault, id: String) { v.dao.deletePostings(id); v.dao.deleteSource(id) }
-    suspend fun refresh(v: Vault) { notes.value = v.orderedNotes() }
-    suspend fun reorder(ids: List<String>) = access { v ->
-        val current = v.orderedNotes()
-        require(ids.size == current.size && ids.toSet() == current.map(Note::id).toSet())
-        v.database.withTransaction { v.setNoteOrder(ids) }
-        changes.value++
-        val byId = current.associateBy(Note::id)
-        notes.value = ids.map { byId.getValue(it) }
+    suspend fun refresh(v: Vault) { notes.value = v.orderedNotes(); storedTags.value = v.dao.tags().map { it.decode() } }
+    suspend fun createTag(name: String): Tag = access { v ->
+        val tag = Tag(name = validateTagName(name, v.dao.tags().map { it.decode() }))
+        v.dao.insertTag(TagRow.of(tag)); storedTags.value = v.dao.tags().map { it.decode() }; changes.value++; tag
+    }
+    suspend fun renameTag(id: String, name: String) = access { v ->
+        val all = v.dao.tags().map { it.decode() }
+        require(all.any { it.id == id }) { "This tag no longer exists." }
+        check(v.dao.updateTag(TagRow.of(Tag(id, validateTagName(name, all, id)))) == 1) { "This tag no longer exists." }
+        storedTags.value = v.dao.tags().map { it.decode() }; changes.value++
+    }
+    suspend fun deleteTag(id: String) = access { v ->
+        flushAccepted(v)
+        v.database.withTransaction {
+            v.dao.notes().map { it.decode() }.filter { id in it.tagIds }.forEach { note ->
+                v.dao.put(NoteRow.of(note.copy(tagIds = note.tagIds - id)))
+            }
+            v.dao.deleteTag(id)
+        }
+        refresh(v); changes.value++
+    }
+    suspend fun reorderVisible(ids: List<String>) = access { v ->
+        flushAccepted(v)
+        val current = v.orderedNotes().map(Note::id)
+        v.database.withTransaction { v.setNoteOrder(reorderSubset(current, ids)) }
+        refresh(v); changes.value++
     }
     suspend fun delete(id: String) = access { v ->
         v.database.withTransaction {
@@ -209,7 +235,9 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
         }
         val mime = context.contentResolver.getType(uri) ?: mimeHint ?: "application/octet-stream"
         val job = ImportRow(importId, note.id, uri.toString(), filename, mime)
-        v.database.withTransaction { saveIn(v, note); v.dao.putImport(job) }
+        val validTags = v.dao.tags().map { it.id }.toSet()
+        val current = note.copy(tagIds = note.tagIds.filter(validTags::contains))
+        v.database.withTransaction { saveIn(v, current, validTags); v.dao.putImport(job) }
         try {
             completeImport(v, job)
         } catch (e: Exception) {
@@ -227,19 +255,20 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
         val (size, hash) = context.contentResolver.openInputStream(uri)!!.use { v.write(job.id, it) { operation.ensureActive() } }
         val attachment = AttachmentRow(job.id, note.id, job.filename, job.mime, size, hash)
         val result = note.copy(document = note.document.copy(attachments = note.document.attachments.filterNot { it == job.id } + job.id), updatedAt = maxOf(System.currentTimeMillis(), note.updatedAt + 1))
-        v.database.withTransaction { v.dao.putAttachment(attachment); saveIn(v, result); v.dao.deleteImport(job.id) }
+        val validTags = v.dao.tags().map { it.id }.toSet()
+        v.database.withTransaction { v.dao.putAttachment(attachment); saveIn(v, result, validTags); v.dao.deleteImport(job.id) }
         runCatching { context.contentResolver.releasePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION) }
         changes.value++
         refresh(v); return result
     }
     suspend fun attachments(): Map<String, AttachmentRow> = access { it.dao.attachments().associateBy { a -> a.id } }
-    suspend fun search(query: String): List<SearchHit> = access { v ->
+    suspend fun search(query: String, filter: NoteFilter = NoteFilter()): List<SearchHit> = access { v ->
         val terms = SearchText.tokens(query).map { it.term }.distinct().take(20)
         if (terms.isEmpty()) return@access emptyList()
         val matches = mutableMapOf<String, MutableSet<String>>()
         val best = mutableMapOf<String, SearchHit>()
         val sources = mutableMapOf<String, SourceRow?>()
-        val noteMap = notes.value.associateBy { it.id }
+        val noteMap = notes.value.filter(filter::includes).associateBy { it.id }
         for (term in terms) {
             val matchingTerms = mutableSetOf<String>()
             var after = ""
@@ -340,12 +369,13 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
         checkAccess()
         val old = vault
         val restoredNotes = staged.orderedNotes()
+        val restoredTags = staged.dao.tags().map { it.decode() }
         // SQLite checkpoint before publishing the generation pointer.
         staged.database.openHelper.writableDatabase.query("PRAGMA wal_checkpoint(FULL)").close()
         checkAccess(); currentCoroutineContext().ensureActive()
         atomicWrite(active, staged.id.toByteArray())
         // After publication, cleanup failure must never make the staged vault deletable.
-        vault = staged; notes.value = restoredNotes
+        vault = staged; notes.value = restoredNotes; storedTags.value = restoredTags
         passphraseConfirmed.value = runCatching { staged.passphraseConfirmed() }.getOrDefault(false); changes.value++
         pending.clear(); encryptedRecovery = null
         runCatching { old?.close() }

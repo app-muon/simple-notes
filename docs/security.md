@@ -2,6 +2,8 @@
 
 ## Boundaries
 
+Tag definitions and note assignments remain inside SQLCipher and encrypted backup manifests. The active tag filter and Find query/ranges are session state cleared on locking; neither is saved in preferences or logs. Find highlights are temporary display styling and never enter persisted documents or undo snapshots. The additive Room 1→2 migration adds tag metadata without changing encryption or enabling a network permission.
+
 The vault protects private application data at rest and gates normal application access using system authentication. It is not a defence against a compromised/rooted OS, an already-authorized external viewer, screenshots the user permits, or keyboard/clipboard behavior controlled by Android and other applications.
 
 The application requests `USE_BIOMETRIC`. AndroidX adds `USE_FINGERPRINT` compatibility declarations and a signature-only internal receiver permission. It does not request `INTERNET`; manifest removal rules also reject transitive Internet declarations. Application components except the launcher/share activity are non-exported. AndroidX also contributes a profile-installation receiver guarded by the system's `DUMP` permission; it has no note-data interface. Providers grant access only to specifically selected URIs. Automatic cloud backup and device transfer are excluded, including device-protected storage domains.

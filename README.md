@@ -1,6 +1,6 @@
 # Notes
 
-A native offline notes app for a Pixel 8 running **Android 15 or later**. The app has no Internet permission, accounts, analytics, or automatic backup. Its product source is [the specification](secure_simple_notes_android_spec.md), with the clarifications recorded below.
+A native offline notes app for a Pixel 8 running **Android 15 or later**. The app has no Internet permission, accounts, analytics, or Android system backup. It supports encrypted backups through a user-chosen file provider. Its product source is [the specification](secure_simple_notes_android_spec.md), with the clarifications recorded below.
 
 ## Build and install
 
@@ -34,6 +34,16 @@ Images and files sit in the **Attachments** section below the text. While editin
 
 Search includes titles, body text, filenames, and locally extracted text from PDFs and UTF-8 text files, including Markdown and CSV. Search ignores case/diacritics, supports prefixes, and tolerates one spelling error for words of four or more characters. Matching terms and postings are paged without an arbitrary result cutoff. Scanned/password-protected/unsupported documents remain searchable by filename. Search indexes are rebuilt locally after restore.
 
+**Find in note:** tap the search icon in an open note, in either reading or editing mode. Find matches literal text in the title and body, including partial words, phrases, punctuation, and line breaks, ignoring case and accents. It highlights every match; Previous/Next wrap through the results and keep the search field focused. While a search is pending, the counter is blank and navigation is disabled. “No matches” appears only when that search finishes.
+
+Close or Back clears Find. While editing, the latest action determines the cursor: changing the query or navigating results makes the active match the destination, but moving the cursor or typing afterward preserves that newer selection. Closing immediately after entering a query resolves it without waiting for the debounce. With no match, the current applicable editor selection is preserved. Done closes Find and finishes editing in one tap; Back closes Find first, then leaves editing, then returns to the list. Ordinary edits and tapping text to edit do not jump back to a Find result. Attachments and tags are excluded. Highlights never become formatting or undo steps.
+
+**Tags:** tap the list's **Notes** title to choose All notes, Untagged, or one tag. The same sheet offers **Manage tags** for creating, renaming, and deleting reusable tags. Names are trimmed, repeated whitespace is collapsed, and duplicates ignoring case are rejected. A note's **Tags** menu assigns any number of tags; assigned tags appear beneath its title. Deleting a tag removes assignments and keeps the notes. Unused tags remain available.
+
+Tag assignments and tag-only undo/redo preserve Find's chosen cursor destination. Undo/redo that changes title text, body text, or formatting takes priority over an earlier Find result. In reading mode, Find keeps the checkbox visible for first-line matches and scrolls directly to matches farther down wrapped checklist text.
+
+Global search respects the selected filter, and new notes inherit a selected tag. Tags alone do not keep an empty new draft. Drag a row or use its accessible Move up/down actions to reorder the visible notes; hidden notes keep their positions. The filter survives navigation and resets when locking or starting a new process. The share-destination picker continues to show all notes.
+
 ## Backup and recovery
 
 On first run the app shows an 8-word **recovery passphrase** and asks for three of the words before continuing. Write it down. It opens your notes if this phone's unlock key is lost (for example after removing the screen lock), and it is the password for every backup. Settings → "View recovery passphrase" shows it again after a fresh biometric/device-credential check. The passphrase cannot be changed, and losing it makes backups unrecoverable.
@@ -59,7 +69,7 @@ The signed APK is in `dist/SecureNotes-1.0.1.apk`. Install it over 1.0.0 to reta
 
 Instrumentation tests must run only on a **test emulator**: the UI fixtures clear this app's emulator data. They do not simulate a successful real biometric; storage/UI fixtures use an in-process test session with no production bypass intent or preference. See [the acceptance checklist](docs/acceptance.md) for the remaining physical-device checks.
 
-Database schema version 1 is exported into `app/schemas`. There is no destructive migration fallback. Any future schema change requires a versioned Room migration and migration tests. Document and backup formats are versioned independently; unsupported versions are rejected without replacing data.
+Database schema versions 1 and 2 are exported into `app/schemas`. The additive 1→2 migration adds encrypted tag definitions and default-empty note assignments without converting historical block documents. There is no destructive migration fallback. Document and backup formats are versioned independently; unsupported versions are rejected without replacing data. Manifest version 3 includes tags; supported tagless manifests restore untagged.
 
 ## Accepted defaults
 

@@ -40,6 +40,11 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.text.input.ImeAction
 import dev.securenotes.search.HitKind
+import dev.securenotes.search.titleWindow
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.input.TransformedText
+import androidx.compose.ui.text.input.OffsetMapping
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
@@ -154,11 +159,11 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
     val restorePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument(), vm::selectRestore)
     val chooseRestore = { restorePicker.launch(arrayOf("*/*")) }
     LaunchedEffect(vm.restoreAfterUnlock) { if (vm.restoreAfterUnlock) chooseRestore() }
-    val back = { keyboard?.hide(); focus.clearFocus(); vm.back() }
+    val back = { if (!vm.findOpen) { keyboard?.hide(); focus.clearFocus() }; vm.back() }
     BackHandler(enabled = vm.screen != Screen.LIST || vm.choosingDestination, onBack = back)
     val activity = androidx.activity.compose.LocalActivity.current
     val currentBack by rememberUpdatedState(back)
-    val editingNote = vm.screen == Screen.NOTE && vm.editing
+    val editingNote = vm.screen == Screen.NOTE && (vm.editing || vm.findOpen)
     DisposableEffect(activity, editingNote) {
         // Editing is a temporary mode: one Back must dismiss both it and the IME.
         // Overlay priority receives system/gesture Back before the keyboard's callback.
@@ -205,11 +210,18 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
 
 @Composable private fun NotesList(vm: NotesViewModel) {
     val all by vm.repository.notes.collectAsStateWithLifecycle()
-    val sorted = all
+    val tags by vm.tagCatalog.collectAsStateWithLifecycle()
+    val sorted = if (vm.choosingDestination) all else all.filter(vm.filter::includes)
+    var filters by remember { mutableStateOf(false) }
     val filtered = if (vm.choosingDestination && vm.query.isNotBlank()) sorted.filter { n -> vm.results.any { it.noteId == n.id } } else sorted
     val state = rememberLazyListState()
-    LaunchedEffect(Unit) { val index = sorted.indexOfFirst { it.id == vm.listAnchor }; if (index >= 0) state.scrollToItem(index, vm.listOffset) }
-    Scaffold(topBar = { TopAppBar(expandedHeight = 56.dp, modifier = Modifier.then(Modifier.semantics { contentDescription = "Notes toolbar" }), title = { Text(if (vm.choosingDestination) "Add to note" else "Notes") }, actions = {
+    LaunchedEffect(vm.filter) { val index = sorted.indexOfFirst { it.id == vm.listAnchor }; state.scrollToItem(index.coerceAtLeast(0), if (index >= 0) vm.listOffset else 0) }
+    Scaffold(topBar = { TopAppBar(expandedHeight = 56.dp, modifier = Modifier.then(Modifier.semantics { contentDescription = "Notes toolbar" }), title = {
+        if (vm.choosingDestination) Text("Add to note") else Row(Modifier.clickable { filters = true }.semantics { contentDescription = "Filter notes" }, verticalAlignment = Alignment.CenterVertically) {
+            Text(vm.filterLabel(tags), maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+            Icon(Icons.Default.ArrowDropDown, null)
+        }
+    }, actions = {
         if (vm.choosingDestination) TextButton(onClick = { vm.share = null; vm.choosingDestination = false; vm.query = "" }) { Text("Cancel") }
         else {
             IconButton(onClick = { vm.query = ""; vm.results = emptyList(); vm.screen = Screen.SEARCH }) { Icon(Icons.Default.Search, "Search") }
@@ -219,8 +231,8 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
         Column(Modifier.padding(padding).fillMaxSize()) {
             if (vm.choosingDestination) OutlinedTextField(vm.query, vm::search, Modifier.fillMaxWidth().padding(16.dp), label = { Text("Search notes") }, singleLine = true)
             if (filtered.isEmpty()) Box(Modifier.fillMaxSize().padding(32.dp), contentAlignment = Alignment.Center) { Text(if (all.isEmpty()) "A quiet place for your notes.\nTap + to begin." else "No matching notes", color = MaterialTheme.colorScheme.onSurfaceVariant) }
-            if (!vm.choosingDestination) ReorderableNotesList(all, state, onOpen = { note ->
-                vm.listAnchor = all.getOrNull(state.firstVisibleItemIndex)?.id; vm.listOffset = state.firstVisibleItemScrollOffset
+            if (!vm.choosingDestination) ReorderableNotesList(filtered, state, onOpen = { note ->
+                vm.listAnchor = filtered.getOrNull(state.firstVisibleItemIndex)?.id; vm.listOffset = state.firstVisibleItemScrollOffset
                 vm.open(note)
             }, onReorder = vm::reorderNotes)
             else LazyColumn(state = state, modifier = Modifier.weight(1f).verticalScrollbar(state), contentPadding = PaddingValues(bottom = 96.dp)) {
@@ -234,6 +246,7 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
             }
         }
     }
+    if (filters) TagFilterSheet(vm) { filters = false }
 }
 
 @Composable private fun SearchScreen(vm: NotesViewModel, back: () -> Unit) {
@@ -256,24 +269,91 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
 
 @Composable private fun NoteScreen(vm: NotesViewModel, back: () -> Unit, attach: (String) -> Unit, openFile: (String) -> Unit) {
     val note = vm.note ?: return
-    val titleFocus = remember { FocusRequester() }
+    val titleFocus = remember(note.id) { FocusRequester() }
+    val findFocus = remember(note.id) { FocusRequester() }
+    var titleValue by remember(note.id) { mutableStateOf(TextFieldValue(note.title)) }
+    if (titleValue.text != note.title) titleValue = titleValue.copy(text = note.title, selection = TextRange(titleValue.selection.start.coerceAtMost(note.title.length)))
+    var titleFocused by remember { mutableStateOf(false) }
+    var restoringTitleFocus by remember { mutableStateOf(false) }
     var editor by remember { mutableStateOf<BodyEditText?>(null) }
     var selectionRevision by remember { mutableIntStateOf(0) }
     var delete by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
+    var tagPicker by remember { mutableStateOf(false) }
     var highlight by remember(note.id) { mutableStateOf(vm.hit) }
     val keyboard = LocalSoftwareKeyboardController.current
     val focus = LocalFocusManager.current
     val scroll = rememberScrollState()
+    val colors = MaterialTheme.colorScheme
+    val visibleTitle = remember(note.title) { titleWindow(note.title) }
+    val readingTitleMatches = remember(visibleTitle, vm.find.titleMatches) {
+        vm.find.titleMatches.mapNotNull { indexed -> visibleTitle.clip(indexed.match)?.let { indexed.copy(match = it) } }
+    }
     // Positions inside the scrolled content, used to jump to a search match.
     var content by remember { mutableStateOf<LayoutCoordinates?>(null) }
     val lineTops = remember(note.id) { mutableStateMapOf<Int, Int>() }
+    val rowTops = remember(note.id) { mutableStateMapOf<Int, Int>() }
+    val lineLayouts = remember(note.id) { mutableStateMapOf<Int, TextLayoutResult>() }
+    var titleLayout by remember(note.id) { mutableStateOf<TextLayoutResult?>(null) }
+    var titleTop by remember(note.id) { mutableIntStateOf(0) }
+    var bodyTop by remember { mutableIntStateOf(0) }
     var attachmentsTop by remember(note.id) { mutableIntStateOf(0) }
     LaunchedEffect(vm.focusTitle, vm.editing) { if (vm.editing && vm.focusTitle) { titleFocus.requestFocus(); keyboard?.show() } }
     LaunchedEffect(vm.bodyFocus, editor) {
         val offset = vm.bodyFocus ?: return@LaunchedEffect
         val body = editor ?: return@LaunchedEffect
-        body.focusAt(offset); vm.focusTitle = false; vm.bodyFocus = null
+        body.focusAt(offset); vm.rememberEditorSelection(HitKind.BODY, offset); vm.focusTitle = false; vm.bodyFocus = null
+    }
+    LaunchedEffect(vm.findOpen) { if (vm.findOpen) {
+        restoringTitleFocus = true
+        try { findFocus.requestFocus(); keyboard?.show() } finally { restoringTitleFocus = false }
+    } }
+    val initialClose = remember(note.id) { vm.findCloseRevision }
+    LaunchedEffect(vm.findCloseRevision) {
+        if (vm.findCloseRevision == initialClose) return@LaunchedEffect
+        if (vm.editing) {
+            val result = vm.consumeFindReturn() ?: return@LaunchedEffect
+            vm.rememberEditorSelection(result.field, result.start, result.end)
+            if (result.field == HitKind.TITLE) {
+                restoringTitleFocus = true
+                try {
+                    titleFocus.requestFocus(); keyboard?.show()
+                    titleValue = titleValue.copy(selection = TextRange(result.start.coerceIn(0, note.title.length), result.end.coerceIn(0, note.title.length)))
+                } finally { restoringTitleFocus = false }
+            } else {
+                editor?.focusAt(result.start, result.end)
+            }
+        } else { keyboard?.hide(); focus.clearFocus() }
+    }
+    LaunchedEffect(vm.findScrollRevision) {
+        val revision = vm.findScrollRevision
+        val match = vm.findScrollTarget ?: return@LaunchedEffect
+        // Layout offsets target the wrapped visual row, not merely the start of its paragraph.
+        withFrameNanos { }
+        val top = when (match.kind) {
+            HitKind.TITLE -> {
+                titleValue = titleValue.copy(selection = TextRange(match.start.coerceAtMost(note.title.length)))
+                if (vm.editing) 0 else {
+                    val layout = withTimeoutOrNull(1_000) { snapshotFlow { titleLayout }.filterNotNull().first() }
+                    titleTop + (layout?.getBoundingBox(visibleTitle.visibleOffset(match.start))?.top?.toInt() ?: 0)
+                }
+            }
+            HitKind.BODY -> if (vm.editing) {
+                bodyTop + (editor?.matchRect(match.start)?.top ?: 0)
+            } else {
+                val line = DocumentEdits.lineAt(note.document.text, match.start)
+                val layout = withTimeoutOrNull(1_000) { snapshotFlow { lineLayouts[line] }.filterNotNull().first() }
+                val offset = (match.start - DocumentEdits.lineStart(note.document.text, line))
+                    .coerceIn(0, (layout?.layoutInput?.text?.length?.minus(1) ?: 0).coerceAtLeast(0))
+                val matchTop = (lineTops[line] ?: 0) + (layout?.getBoundingBox(offset)?.top?.toInt() ?: 0)
+                // Keep the first row's checkbox whole without sending deep wrapped matches back to the paragraph start.
+                if (note.document.lines[line].type == LineType.CHECKLIST && layout?.getLineForOffset(offset) == 0)
+                    minOf(rowTops[line] ?: matchTop, matchTop)
+                else matchTop
+            }
+            else -> 0
+        }
+        if (revision == vm.findScrollRevision && vm.findScrollTarget == match) scroll.scrollTo(top.coerceAtLeast(0))
     }
     LaunchedEffect(note.id, vm.hit) {
         vm.hit?.let { hit ->
@@ -281,7 +361,7 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
                 HitKind.TITLE -> 0
                 HitKind.BODY -> {
                     val line = DocumentEdits.lineAt(note.document.text, hit.start)
-                    withTimeoutOrNull(1_000) { snapshotFlow { lineTops[line] }.filterNotNull().first() } ?: 0
+                    withTimeoutOrNull(1_000) { snapshotFlow { rowTops[line] }.filterNotNull().first() } ?: 0
                 }
                 HitKind.ATTACHMENT -> attachmentsTop
             }
@@ -289,47 +369,77 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
             delay(2200); highlight = null
         }
     }
-    val leave = { keyboard?.hide(); focus.clearFocus(); vm.back() }
+    val leave = { if (!vm.findOpen) { keyboard?.hide(); focus.clearFocus() }; vm.back() }
+    val done = { keyboard?.hide(); focus.clearFocus(); vm.finishEditing() }
     val barColor by animateColorAsState(if (vm.editing) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface, label = "Editing header")
-    Scaffold(modifier = Modifier.imePadding(), topBar = { TopAppBar(colors = TopAppBarDefaults.topAppBarColors(containerColor = barColor),
+    Scaffold(modifier = Modifier.imePadding(), topBar = { Column { TopAppBar(colors = TopAppBarDefaults.topAppBarColors(containerColor = barColor),
         title = { Text(if (vm.editing) "Editing" else "Note", style = MaterialTheme.typography.titleMedium) }, navigationIcon = { BackButton(back) }, actions = {
-        if (vm.editing) IconButton(onClick = leave) { Icon(Icons.Default.Check, "Done") }
+        if (vm.editing) IconButton(onClick = done) { Icon(Icons.Default.Check, "Done") }
+        IconButton(onClick = {
+            if (!vm.findOpen) {
+                if (titleFocused) vm.rememberEditorSelection(HitKind.TITLE, titleValue.selection.start, titleValue.selection.end)
+                else editor?.takeIf { it.hasFocus() }?.let { vm.rememberEditorSelection(HitKind.BODY, it.selectionStart, it.selectionEnd) }
+                highlight = null; vm.openFind()
+            } else findFocus.requestFocus()
+        }) { Icon(Icons.Default.Search, "Find in note") }
         Box {
             IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "Note menu") }
-            DropdownMenu(menu, { menu = false }) { DropdownMenuItem(text = { Text("Delete") }, leadingIcon = { Icon(Icons.Default.DeleteOutline, null) }, onClick = { menu = false; delete = true }) }
+            DropdownMenu(menu, { menu = false }) {
+                DropdownMenuItem(text = { Text("Tags") }, leadingIcon = { Icon(Icons.Default.Label, null) }, onClick = { menu = false; tagPicker = true })
+                DropdownMenuItem(text = { Text("Delete") }, leadingIcon = { Icon(Icons.Default.DeleteOutline, null) }, onClick = { menu = false; delete = true })
+            }
         }
-    }) }, bottomBar = { if (vm.editing) EditorToolbar(vm, editor, selectionRevision) }) { padding ->
+    }); if (vm.findOpen) FindBar(vm, findFocus) } }, bottomBar = { if (vm.editing) EditorToolbar(vm, editor, selectionRevision) }) { padding ->
         Column(Modifier.fillMaxSize().padding(padding).verticalScrollbar(scroll).verticalScroll(scroll).onGloballyPositioned { content = it }
             .padding(start = 24.dp, end = 24.dp, bottom = 100.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             if (vm.editing) {
-                OutlinedTextField(note.title, { vm.change(note.copy(title = it), typing = true) }, modifier = Modifier.fillMaxWidth().focusRequester(titleFocus),
+                OutlinedTextField(titleValue, { incoming ->
+                    // Compose collapses ranges on blur. Focus transfer is not a user selection change.
+                    val value = if (incoming.text == titleValue.text && (restoringTitleFocus || !titleFocused)) incoming.copy(selection = titleValue.selection) else incoming
+                    if (value.text != titleValue.text || value.selection != titleValue.selection) vm.editorInteracted(HitKind.TITLE, value.selection.start, value.selection.end)
+                    titleValue = value; vm.change(note.copy(title = value.text), typing = true)
+                }, modifier = Modifier.fillMaxWidth().focusRequester(titleFocus).onFocusChanged {
+                    titleFocused = it.isFocused
+                    if (it.isFocused && !restoringTitleFocus && !vm.focusTitle) vm.editorInteracted(HitKind.TITLE, titleValue.selection.start, titleValue.selection.end)
+                },
                     placeholder = { Text("Title") }, textStyle = MaterialTheme.typography.headlineLarge, singleLine = true,
+                    visualTransformation = VisualTransformation { TransformedText(withFindHighlights(it, vm.find.titleMatches, vm.find.activeIndex, 0, colors), OffsetMapping.Identity) },
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next), keyboardActions = KeyboardActions(onNext = { vm.bodyFocus = note.document.text.length }))
-                RichBodyEditor(note.document, MaterialTheme.colorScheme.onSurface, MaterialTheme.colorScheme.primary, Modifier.fillMaxWidth().heightIn(min = 160.dp),
-                    onReady = { editor = it }, onChange = vm::editBody, onSelection = { selectionRevision++ }, onLeave = leave)
+                AssignedTags(vm) { tagPicker = true }
+                RichBodyEditor(note.document, MaterialTheme.colorScheme.onSurface, MaterialTheme.colorScheme.primary, Modifier.fillMaxWidth().heightIn(min = 160.dp)
+                    .onGloballyPositioned { coordinates -> content?.let { bodyTop = it.localPositionOf(coordinates, Offset.Zero).y.toInt() } },
+                    onReady = { editor = it }, onChange = vm::editBody, onSelection = { selectionRevision++ },
+                    onUserSelection = { start, end -> vm.editorInteracted(HitKind.BODY, start, end) }, onLeave = leave, find = vm.find)
             } else SelectionContainer {
                 // One selection area for the whole note, so Select All and copy span every line.
                 Column {
-                    Text(note.displayTitle, Modifier.fillMaxWidth().clickable { vm.enterEditing() }.padding(vertical = 12.dp)
-                        .background(if (highlight?.kind == HitKind.TITLE) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent), style = MaterialTheme.typography.headlineLarge)
-                    ReadingBody(vm, note, highlight) { line, coordinates -> content?.let { lineTops[line] = it.localPositionOf(coordinates, Offset.Zero).y.toInt() } }
+                    Text(withFindHighlights(AnnotatedString(note.displayTitle), readingTitleMatches, vm.find.activeIndex, 0, colors), Modifier.fillMaxWidth().clickable { vm.enterEditing() }.padding(vertical = 12.dp)
+                        .background(if (highlight?.kind == HitKind.TITLE) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent)
+                        .onGloballyPositioned { coordinates -> content?.let { titleTop = it.localPositionOf(coordinates, Offset.Zero).y.toInt() } },
+                        onTextLayout = { titleLayout = it }, style = MaterialTheme.typography.headlineLarge)
+                    DisableSelection { AssignedTags(vm) { tagPicker = true } }
+                    ReadingBody(vm, note, highlight, laidOut = { line, layout -> lineLayouts[line] = layout },
+                        rowPlaced = { line, coordinates -> content?.let { rowTops[line] = it.localPositionOf(coordinates, Offset.Zero).y.toInt() } },
+                        textPlaced = { line, coordinates -> content?.let { lineTops[line] = it.localPositionOf(coordinates, Offset.Zero).y.toInt() } })
                 }
             }
             AttachmentsSection(vm, note, highlight, attach, openFile, Modifier.onGloballyPositioned { c -> content?.let { attachmentsTop = it.localPositionOf(c, Offset.Zero).y.toInt() } })
         }
     }
+    if (tagPicker) TagPickerSheet(vm) { tagPicker = false }
     if (delete) AlertDialog(onDismissRequest = { delete = false }, title = { Text("Delete this note?") }, text = { Text("This permanently deletes the note and its attachments.") }, confirmButton = { TextButton(onClick = { delete = false; vm.delete() }) { Text("Delete") } }, dismissButton = { TextButton(onClick = { delete = false }) { Text("Cancel") } })
 }
 
 /** Reading mode: one Text per line inside the caller's selection area; list markers are not selectable. */
-@Composable private fun ReadingBody(vm: NotesViewModel, note: Note, highlight: dev.securenotes.search.SearchHit?, placed: (Int, LayoutCoordinates) -> Unit) {
+@Composable private fun ReadingBody(vm: NotesViewModel, note: Note, highlight: dev.securenotes.search.SearchHit?, laidOut: (Int, TextLayoutResult) -> Unit,
+    rowPlaced: (Int, LayoutCoordinates) -> Unit, textPlaced: (Int, LayoutCoordinates) -> Unit) {
     val document = note.document
     val starts = remember(document.text) { DocumentEdits.lineStarts(document.text) }
     document.lines.forEachIndexed { i, line ->
         val start = starts[i]
         val end = if (i + 1 < starts.size) starts[i + 1] - 1 else document.text.length
         val match = highlight?.takeIf { it.kind == HitKind.BODY && it.start >= start && it.end <= end }
-        Row(Modifier.fillMaxWidth().onGloballyPositioned { placed(i, it) }, verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.fillMaxWidth().onGloballyPositioned { rowPlaced(i, it) }, verticalAlignment = Alignment.CenterVertically) {
             DisableSelection {
                 when (line.type) {
                     LineType.CHECKLIST -> Checkbox(line.checked, { vm.setChecked(i, it) }, modifier = Modifier.semantics { contentDescription = document.text.substring(start, end).ifBlank { "Checklist item" } })
@@ -338,8 +448,8 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
                     else -> Unit
                 }
             }
-            Text(annotatedLine(document, start, end, match, MaterialTheme.colorScheme.secondaryContainer, MaterialTheme.colorScheme.primary),
-                Modifier.weight(1f).clickable { vm.enterEditing(end) }.padding(vertical = 4.dp),
+            Text(withFindHighlights(annotatedLine(document, start, end, match, MaterialTheme.colorScheme.secondaryContainer, MaterialTheme.colorScheme.primary), vm.find.bodyMatchesByLine[i].orEmpty(), vm.find.activeIndex, start, MaterialTheme.colorScheme),
+                Modifier.weight(1f).clickable { vm.enterEditing(end) }.padding(vertical = 4.dp).onGloballyPositioned { textPlaced(i, it) }, onTextLayout = { laidOut(i, it) },
                 style = when (line.type) { LineType.HEADING1 -> MaterialTheme.typography.headlineMedium; LineType.HEADING2 -> MaterialTheme.typography.titleLarge; else -> MaterialTheme.typography.bodyLarge })
         }
     }

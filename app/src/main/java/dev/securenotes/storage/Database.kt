@@ -6,9 +6,15 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.serialization.encodeToString
 
 @Entity(tableName = "notes")
-data class NoteRow(@PrimaryKey val id: String, val title: String, val document: String, val createdAt: Long, val updatedAt: Long) {
-    fun decode() = Note(id, title, documentJson.decodeFromString<Document>(document), createdAt, updatedAt)
-    companion object { fun of(note: Note) = NoteRow(note.id, note.title, documentJson.encodeToString(note.document), note.createdAt, note.updatedAt) }
+data class NoteRow(@PrimaryKey val id: String, val title: String, val document: String, val createdAt: Long, val updatedAt: Long,
+    @ColumnInfo(defaultValue = "'[]'") val tagIds: String = "[]") {
+    fun decode() = Note(id, title, documentJson.decodeFromString<Document>(document), createdAt, updatedAt, documentJson.decodeFromString<List<String>>(tagIds))
+    companion object { fun of(note: Note) = NoteRow(note.id, note.title, documentJson.encodeToString(note.document), note.createdAt, note.updatedAt, documentJson.encodeToString(note.tagIds)) }
+}
+@Entity(tableName = "tags", indices = [Index(value = ["nameKey"], unique = true)])
+data class TagRow(@PrimaryKey val id: String, val name: String, val nameKey: String) {
+    fun decode() = Tag(id, name)
+    companion object { fun of(tag: Tag) = TagRow(tag.id, tag.name, tagKey(tag.name)) }
 }
 @kotlinx.serialization.Serializable
 @Entity(tableName = "attachments", indices = [Index("noteId")])
@@ -27,6 +33,10 @@ data class PostingRow(@PrimaryKey(autoGenerate = true) val id: Long = 0, val sou
     val uri: String, val filename: String, val mime: String)
 
 @Dao interface NotesDao {
+    @Query("SELECT * FROM tags ORDER BY nameKey, id") suspend fun tags(): List<TagRow>
+    @Insert(onConflict = OnConflictStrategy.ABORT) suspend fun insertTag(row: TagRow)
+    @Update(onConflict = OnConflictStrategy.ABORT) suspend fun updateTag(row: TagRow): Int
+    @Query("DELETE FROM tags WHERE id = :id") suspend fun deleteTag(id: String)
     @Query("SELECT * FROM notes") fun observe(): Flow<List<NoteRow>>
     @Query("SELECT * FROM notes") suspend fun notes(): List<NoteRow>
     @Query("SELECT * FROM notes WHERE id = :id") suspend fun note(id: String): NoteRow?
@@ -55,5 +65,12 @@ data class PostingRow(@PrimaryKey(autoGenerate = true) val id: Long = 0, val sou
     @Upsert suspend fun putImport(row: ImportRow)
     @Query("DELETE FROM imports WHERE id = :id") suspend fun deleteImport(id: String)
 }
-@Database(entities = [NoteRow::class, AttachmentRow::class, SourceRow::class, PostingRow::class, SecretRow::class, ImportRow::class], version = 1, exportSchema = true)
+val MIGRATION_1_2 = object : androidx.room.migration.Migration(1, 2) {
+    override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE notes ADD COLUMN tagIds TEXT NOT NULL DEFAULT '[]'")
+        db.execSQL("CREATE TABLE IF NOT EXISTS tags (id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL, nameKey TEXT NOT NULL)")
+        db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_tags_nameKey ON tags (nameKey)")
+    }
+}
+@Database(entities = [NoteRow::class, AttachmentRow::class, SourceRow::class, PostingRow::class, SecretRow::class, ImportRow::class, TagRow::class], version = 2, exportSchema = true)
 abstract class NotesDatabase : RoomDatabase() { abstract fun dao(): NotesDao }

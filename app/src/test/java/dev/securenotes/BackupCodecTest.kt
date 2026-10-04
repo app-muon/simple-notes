@@ -47,7 +47,7 @@ class BackupCodecTest {
         BackupService.validate(BackupManifest(version = 1, notes = listOf(note), attachments = emptyList(), sort = SortOrder.EDITED))
         BackupService.validate(BackupManifest(notes = listOf(note), attachments = emptyList(), order = listOf(note.id)))
         assertThrows(IllegalArgumentException::class.java) { BackupService.validate(BackupManifest(version = 1, notes = listOf(note, note), attachments = emptyList(), sort = SortOrder.EDITED)) }
-        assertThrows(IllegalArgumentException::class.java) { BackupService.validate(BackupManifest(version = 3, notes = listOf(note), attachments = emptyList(), sort = SortOrder.EDITED)) }
+        assertThrows(IllegalArgumentException::class.java) { BackupService.validate(BackupManifest(version = 4, notes = listOf(note), attachments = emptyList(), order = listOf(note.id))) }
         val id = newId()
         val attached = note.copy(document = Document(attachments = listOf(id)))
         val owned = AttachmentRow(id, attached.id, "x", "text/plain", 1, "a".repeat(64))

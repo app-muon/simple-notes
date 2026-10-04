@@ -1,6 +1,72 @@
-# Verification — 3 October 2026
+# Verification — 4 October 2026
 
-## Current source: 1.0.2 (3)
+## Find checklist and cursor-priority follow-up: current source 1.0.2 (3)
+
+Find now keeps the full checkbox visible for matches on a checklist's first visual line while retaining text-based scrolling for deep wrapped matches. Tag assignments and tag-only history preserve Find's cursor destination; text/formatting history and checkbox edits count as editor interactions. Removed redundant saved-selection state and used the tested title-clipping helper in reading-mode rendering. Text changes still invalidate highlights while the replacement search is pending. Room remains at schema 2 and backup manifests at version 3.
+
+- JVM unit tests: **56 passed**.
+- Full UI run: **33 of 34 passed** initially. The only failure was the new wrapped-match test comparing text-layout coordinates with accessibility bounds that include padding. Corrected the test's coordinate conversion; production scrolling needed no additional change.
+- Focused final UI runs: **5 passed in compact light mode and 5 passed in compact dark mode**, including the corrected checklist test, tag assignment/history, body text/formatting history, title history, and trimmed-title/tap-to-edit behavior. All 34 distinct UI cases therefore passed across the full run and corrected focused reruns; the complete suite was not rerun after the assertion correction.
+- Compact layout: **360×640 dp** (900×1600 px, density 400). Inspected light/dark screenshots for the complete first checkbox, the deep wrapped match, highlights, Find controls, and scrollbar visibility. Focus and selection restoration are asserted by the UI tests.
+- Debug APK and instrumentation APK: **built successfully**. Debug lint: **0 errors, 7 existing advisory warnings**. `git diff --check`: **passed**.
+- Storage code was unchanged in this follow-up; the **24 passing storage tests** from the preceding review below were not rerun.
+
+Tests used synthetic vaults on a disposable, headless, read-only Pixel 8 emulator (Android 17 / API 37, emulator-5580) with a test PIN. Artifacts are under `%TEMP%\notes-find-followup-build`:
+
+- `app/outputs/apk/debug/app-debug.apk` and `app/outputs/apk/androidTest/debug/app-debug-androidTest.apk`.
+- `app/reports/tests/testDebugUnitTest` and `app/reports/lint-results-debug.html`.
+- `app/reports/androidTests/connected/debug` and `app/outputs/androidTest-results/connected/debug`: the full run, including the subsequently corrected assertion failure.
+- `compact-light-tests.txt` and `compact-dark-tests.txt`: passing final focused runs.
+- `screenshots-light` and `screenshots-dark`: inspected compact layouts.
+
+The signed `dist` release was not replaced. Remaining physical-device checks are in [the acceptance checklist](acceptance.md).
+
+## Preceding Find interaction and tag review: source 1.0.2 (3)
+
+Implemented the follow-up review: latest-action cursor/focus restoration, immediate Close during pending search, one-tap Done, explicit Find scrolling, pending generations, independent prepared-text caches, multiline grouping, trimmed-title offsets, full checklist-row scrolling, conflict-safe tag insertion/update, shared validated tag IDs, a read-only lock-aware catalog projection, centralized deletion reconciliation, and one ordering operation. Room stays at schema 2 and backup manifests at version 3.
+
+- JVM unit tests: **56 passed**, including eight deterministic Find-session tests for pending state, superseded/cancelled work, immediate Close, independent cache invalidation/reuse, cancelled scroll requests, multiline grouping, and title offset clipping. Existing accent, emoji, overlap, document, backup, and history tests also pass.
+- Full storage suite: **24 passed**. Direct DAO conflicts leave existing rows intact; failed tag operations do not publish change notifications. Stale snapshots cannot restore deleted assignments. Full/subset ordering, hidden slots, backup round-trips, migration, and lock-time saving pass.
+- Full UI suite after fixes: **30 passed**. Covers body/title selection and typing before Close, no-match range preservation, Close during debounce, later-input/reopen/note-switch/lock guards, Done, staged Back, failed-save editability, formatting/history, deep wrapped matches, title whitespace, tap-to-edit scrolling, checklist visibility, catalog reconciliation, immediate assignment, and lock clearing.
+- Compact **360×640 dp** checks (900×1600 px, density 400): **6 light-theme tests and 10 dark-theme tests passed**. The checklist fixture was then strengthened with trailing paragraphs so the result can align at the viewport top; that regression passed again in both themes. Light/dark screenshots were inspected for visible controls, active/ordinary highlights, caret placement, full checkboxes, and vertical/horizontal scrollbars. Accessible control labels are exercised by UI selectors.
+- Debug APK and instrumentation APK: **built successfully**. Debug lint: **0 errors, 7 existing advisory warnings**. `git diff --check`: **passed**.
+
+Verification used synthetic vaults on a disposable, headless, read-only Pixel 8 emulator (Android 17 / API 37, emulator-5580) with a test PIN. The first full run exposed Compose collapsing a title range during focus transfer; selection-only blur callbacks are now distinguished from user input, and the full UI rerun passes. A tag-management test also needed to wait for the asynchronous rename dialog to dismiss. The storage suite passed in the initial combined run; subsequent production changes affected Find/editor code only. The final strengthened checklist fixture was compiled/linted and verified separately in both themes.
+
+Artifacts are under `%TEMP%\notes-find-review-build`:
+
+- `app/outputs/apk/debug/app-debug.apk` and `app/outputs/apk/androidTest/debug/app-debug-androidTest.apk`.
+- `app/reports/tests/testDebugUnitTest`, `app/reports/lint-results-debug.html`.
+- `initial-suite-report` / `initial-suite-results`: all 24 passing storage tests and the two subsequently fixed UI failures.
+- `final-ui-report` / `final-ui-results`: all 30 passing UI tests.
+- `compact-light-tests.txt`, `compact-dark-tests.txt`, `checklist-light-tests.txt`, `checklist-dark-tests.txt`.
+- `screenshots-light` and `screenshots-dark`: reviewed compact layouts.
+
+Physical TalkBack, large fonts, and external-provider/device acceptance remain in [the acceptance checklist](acceptance.md). The signed `dist` release was not replaced.
+
+## Initial Find and tags implementation: 1.0.2 (3)
+
+Implemented Find in reading/editing, reusable tags and one active filter, scoped global search, and filtered drag/accessibility ordering. Tags use the additive Room 1→2 migration inside SQLCipher and backup manifest 3; the encrypted container remains version 1. Supported tagless manifests restore untagged. Historical block-document conversion is outside this change.
+
+- JVM unit tests: **48 passed**, including literal/overlapping matches, phrases and newlines, Unicode offsets, navigation, tag validation, subset order, and invalid backup references.
+- Storage instrumentation: **23 passed**, including encrypted schema upgrade, tag persistence/reopen, pending-edit flush before deletion, hidden-slot preservation, unused tag backup/restore, and metadata change notifications/fingerprints.
+- Full UI suite: **23 passed**, including Find focus, title/body cursor restoration, Back behavior, formatting and undo/redo, deep wrapped titles/paragraphs, ordinary edits without Find-driven scrolling, tag sheets, conflicts/deletion, inherited empty drafts, scoped search, filtered drag/accessibility moves, and lock reset.
+- Compact dark-mode pass: **5 passed** at 360×640 dp (900×1600 px, density 400), covering the Find and tag flows. Light and dark screenshots were inspected for controls, distinct highlights, the compact header, and vertical/horizontal scrollbars.
+- Debug APK and test APK assembly: **passed**. Debug lint: **0 errors, 7 existing advisory warnings**. `git diff --check`: **passed**.
+
+Instrumentation used synthetic vaults on a disposable read-only Pixel 8 AVD, Android 17 / API 37, with a test PIN; no physical phone was used. An initial tag-picker test had an ambiguous selector and was corrected. The new native-caret regression also exposed the generic test activity's default window panning; its fixture now uses the same `adjustResize` mode as production. All final tests above passed. A final guard preventing late tag operations from repopulating locked UI state was rebuilt/linted and covered by the compact tag/lock pass.
+
+Artifacts are under `%TEMP%\notes-find-tags-build`:
+
+- `app/outputs/apk/debug/app-debug.apk` — current debug build; the signed `dist` release was not replaced.
+- `app/reports/tests/testDebugUnitTest` and `app/reports/androidTests/connected/debug` — passing unit and full UI reports.
+- `full-suite-results` / `full-suite-report` — the initial combined run, containing all 23 passing storage tests and the subsequently corrected UI selector failure.
+- `app/reports/lint-results-debug.html`, `focused-find-tests.txt`, and `compact-dark-tests.txt`.
+- `screenshots-light`, `screenshots-focus-fixed`, and `screenshots-compact-dark-final` — reviewed screenshots.
+
+Physical TalkBack, large fonts, external file-provider automatic backup uploads, and the remaining device checks stay in [the acceptance checklist](acceptance.md). The metadata notification and fingerprint tests do not establish a provider's upload behavior.
+
+## Previous verification: 3 October 2026, source 1.0.2 (3)
 
 The current source includes the single-body editor, recovery passphrase, automatic backups, manual note ordering, compact notes header, and five-minute authentication grace period. This source verification uses fresh synthetic vaults on a disposable Pixel 8 emulator, Android 17 / API 37, with a test PIN.
 

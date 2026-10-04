@@ -20,7 +20,13 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import dev.securenotes.document.*
+import dev.securenotes.search.*
 import kotlinx.coroutines.launch
+
+/** Display-only search styling; excluded from document formatting and undo snapshots. */
+class FindHighlightSpan(private val background: Int, private val foreground: Int) : android.text.style.CharacterStyle() {
+    override fun updateDrawState(paint: TextPaint) { paint.bgColor = background; paint.color = foreground }
+}
 
 /** Heading size and weight, kept apart from bold [StyleSpan]s so it is never mistaken for bold text. */
 class HeadingSpan(level: Int) : MetricAffectingSpan() {
@@ -72,6 +78,7 @@ class BodyEditText(context: Context) : EditText(context) {
     var leave: () -> Unit = {}
     var caret: (android.graphics.Rect) -> Unit = {}
     var selectionChanged: () -> Unit = {}
+    var userSelection: (Int, Int) -> Unit = { _, _ -> }
     var markerColor: Int = 0xFF000000.toInt()
     private val margin = (28 * resources.displayMetrics.density).toInt()
     private var suppress = false
@@ -142,6 +149,7 @@ class BodyEditText(context: Context) : EditText(context) {
         // Bold follows the editor's own spans so composing text behaves natively.
         document = result.document.copy(bold = DocumentEdits.normalize(boldSpans(result.document.text.length)))
         applyLineSpans()
+        userSelection(selectionStart, selectionEnd)
         changed(document, !pasting)
         reportCaret()
     }
@@ -181,13 +189,13 @@ class BodyEditText(context: Context) : EditText(context) {
     /** Shows [value] unless the editor already holds it (the normal case after typing). */
     fun show(value: Document, force: Boolean = false) {
         if (!force && value == document) return
-        val selection = selectionStart.coerceAtLeast(0)
+        val selection = selectionStart.coerceAtLeast(0); val end = selectionEnd.coerceAtLeast(0)
         suppress = true
         val shown = displayed(value)
         if (text.toString() != shown) setText(shown)
         document = value
         applyBold(); applyLineSpans()
-        setSelection(selection.coerceIn(0, value.text.length))
+        setSelection(selection.coerceIn(0, value.text.length), end.coerceIn(0, value.text.length))
         suppress = false
     }
     private fun format(value: Document) {
@@ -195,15 +203,33 @@ class BodyEditText(context: Context) : EditText(context) {
         val start = selectionStart; val end = selectionEnd
         document = value; syncEndMarker(); applyBold(); applyLineSpans(); invalidate()
         suppress = true; setSelection(start.coerceIn(0, value.text.length), end.coerceIn(0, value.text.length)); suppress = false
-        changed(document, false); selectionChanged()
+        userSelection(start, end); changed(document, false); selectionChanged()
     }
     fun toggleBold() = format(DocumentEdits.toggleBold(document, selectionStart, selectionEnd))
     fun toggleLine(type: LineType) = format(DocumentEdits.setLineType(document, selectionStart, selectionEnd, type))
     fun activeType(): LineType? = DocumentEdits.activeType(document, selectionStart.coerceAtLeast(0), selectionEnd.coerceAtLeast(0))
     fun isBold(): Boolean = DocumentEdits.isBold(document, minOf(selectionStart, selectionEnd), maxOf(selectionStart, selectionEnd))
-    fun focusAt(offset: Int) {
-        requestFocus(); setSelection(offset.coerceIn(0, document.text.length))
-        post { windowInsetsController?.show(android.view.WindowInsets.Type.ime()) }
+    fun focusAt(offset: Int, end: Int = offset) {
+        suppress = true
+        try { requestFocus(); setSelection(offset.coerceIn(0, document.text.length), end.coerceIn(0, document.text.length)) }
+        finally { suppress = false }
+        selectionChanged()
+        post { if (hasFocus()) { windowInsetsController?.show(android.view.WindowInsets.Type.ime()); reportCaret() } }
+    }
+    fun findHighlights(find: FindState, normal: Int, active: Int, foreground: Int, activeForeground: Int) {
+        val s = text ?: return
+        s.getSpans(0, s.length, FindHighlightSpan::class.java).forEach(s::removeSpan)
+        val matches = find.matches.filter { it.kind == HitKind.BODY }
+        (matches.filter { it != find.active } + listOfNotNull(find.active?.takeIf { it in matches })).forEach { match ->
+            val end = match.end.coerceAtMost(document.text.length)
+            if (match.start < end) s.setSpan(FindHighlightSpan(if (match == find.active) active else normal,
+                if (match == find.active) activeForeground else foreground), match.start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+    }
+    fun matchRect(offset: Int): android.graphics.Rect? {
+        val layout = layout ?: return null
+        val line = layout.getLineForOffset(offset.coerceIn(0, document.text.length))
+        return android.graphics.Rect(0, layout.getLineTop(line) + totalPaddingTop, width, layout.getLineBottom(line) + totalPaddingTop)
     }
     /** Backspace at the very start of the body has no text to delete, so it clears a list format directly. */
     private fun clearFirstLineList(): Boolean {
@@ -222,9 +248,16 @@ class BodyEditText(context: Context) : EditText(context) {
         // Keep the cursor and selection (including Select All) before the invisible end marker.
         val limit = contentLength()
         if (selStart > limit || selEnd > limit) { setSelection(minOf(selStart, limit), minOf(selEnd, limit)); return }
-        selectionChanged(); post { reportCaret() }
+        selectionChanged()
+        if (hasFocus()) userSelection(selStart, selEnd)
+        post { reportCaret() }
+    }
+    override fun onFocusChanged(focused: Boolean, direction: Int, previouslyFocusedRect: android.graphics.Rect?) {
+        super.onFocusChanged(focused, direction, previouslyFocusedRect)
+        if (ready && focused && !suppress) userSelection(selectionStart, selectionEnd)
     }
     private fun reportCaret() {
+        if (!hasFocus()) return
         val layout = layout ?: return
         val offset = selectionEnd.coerceIn(0, text?.length ?: 0)
         val line = layout.getLineForOffset(offset)
@@ -240,6 +273,7 @@ class BodyEditText(context: Context) : EditText(context) {
         return line.takeIf { document.lines[it].type == LineType.CHECKLIST && DocumentEdits.lineStart(document.text, it) == offset }
     }
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) userSelection(selectionStart, selectionEnd)
         if (event.actionMasked == MotionEvent.ACTION_DOWN) touchedCheckbox = checkboxAt(event.x, event.y)
         val line = touchedCheckbox ?: return super.onTouchEvent(event)
         if (event.actionMasked == MotionEvent.ACTION_UP && checkboxAt(event.x, event.y) == line) {
@@ -265,18 +299,22 @@ class BodyEditText(context: Context) : EditText(context) {
 
 @Composable
 fun RichBodyEditor(document: Document, color: Color, markerColor: Color, modifier: Modifier, onReady: (BodyEditText?) -> Unit,
-    onChange: (Document, Boolean) -> Unit, onSelection: () -> Unit, onLeave: () -> Unit) {
+    onChange: (Document, Boolean) -> Unit, onSelection: () -> Unit, onUserSelection: (Int, Int) -> Unit,
+    onLeave: () -> Unit, find: FindState = FindState()) {
     val currentChange by rememberUpdatedState(onChange)
     val currentSelection by rememberUpdatedState(onSelection)
+    val currentUserSelection by rememberUpdatedState(onUserSelection)
     val currentLeave by rememberUpdatedState(onLeave)
     val requester = remember { BringIntoViewRequester() }
     val scope = rememberCoroutineScope()
     val density = androidx.compose.ui.platform.LocalDensity.current
+    val colors = androidx.compose.material3.MaterialTheme.colorScheme
     AndroidView(modifier = modifier.bringIntoViewRequester(requester), factory = { context ->
         BodyEditText(context).apply {
             hint = "Note"; textSize = 18f
             changed = { value, typing -> currentChange(value, typing) }
             selectionChanged = { currentSelection() }
+            userSelection = { start, end -> currentUserSelection(start, end) }
             leave = { currentLeave() }
             // Keep the cursor (plus a little space) visible above the keyboard while the column scrolls.
             caret = { r -> scope.launch { requester.bringIntoView(androidx.compose.ui.geometry.Rect(r.left.toFloat(), r.top.toFloat(), r.right.toFloat(), r.bottom + with(density) { 48.dp.toPx() })) } }
@@ -286,5 +324,6 @@ fun RichBodyEditor(document: Document, color: Color, markerColor: Color, modifie
         view.setTextColor(color.toArgb()); view.setHintTextColor(color.copy(alpha = .45f).toArgb())
         view.markerColor = markerColor.toArgb()
         view.show(document)
+        view.findHighlights(find, colors.secondaryContainer.toArgb(), colors.primary.toArgb(), colors.onSecondaryContainer.toArgb(), colors.onPrimary.toArgb())
     })
 }

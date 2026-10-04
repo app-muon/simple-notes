@@ -7,15 +7,17 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.securenotes.NotesApplication
 import dev.securenotes.document.*
-import dev.securenotes.search.SearchHit
+import dev.securenotes.search.*
 import dev.securenotes.security.Passphrase
 import dev.securenotes.storage.AttachmentRow
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 enum class Screen { LIST, NOTE, SEARCH, SETTINGS, IMAGE }
 data class SharedContent(val text: String?, val uris: List<Uri>, val mime: String?)
+data class EditorSelection(val field: HitKind, val start: Int, val end: Int = start)
 
 class NotesViewModel(application: Application) : AndroidViewModel(application) {
     val app = application as NotesApplication
@@ -57,6 +59,33 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     var listAnchor: String? = null
     var listOffset: Int = 0
     var historyRevision by mutableIntStateOf(0)
+    var filter by mutableStateOf(NoteFilter())
+        private set
+    val tagCatalog = combine(repository.tags, app.unlocked) { values, unlocked -> if (unlocked) values else emptyList() }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+    // Synchronous reads also see a just-created tag before the flow collector resumes.
+    val tags: List<Tag> get() = if (app.unlocked.value) repository.tags.value else emptyList()
+    val filterLabel: String get() = filterLabel(tags)
+    fun filterLabel(catalog: List<Tag>) = if (filter.untagged) "Untagged" else catalog.firstOrNull { it.id == filter.tagId }?.name ?: "Notes"
+    var findOpen by mutableStateOf(false)
+        private set
+    var find by mutableStateOf(FindState())
+        private set
+    var findScrollRevision by mutableIntStateOf(0)
+        private set
+    var findCloseRevision by mutableIntStateOf(0)
+        private set
+    var findReturn: EditorSelection? = null
+        private set
+    var findScrollTarget: FindMatch? = null
+        private set
+    private var editorSelection = EditorSelection(HitKind.TITLE, 0)
+    private var editorRevision = 0L
+    private var findActionRevision = 0L
+    private var returnRevision = 0L
+    private val finder = FindSession(viewModelScope, publish = { find = it }, scroll = {
+        findScrollTarget = find.active; findScrollRevision++
+    })
     val history = EditHistory()
     private var searchJob: Job? = null
     private var operation: Job? = null
@@ -66,6 +95,7 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     // viewModelScope runs on Main.immediate, so these collectors start inside the constructor. Any property they
     // touch must be declared above this block; properties below it are not initialized yet.
     init {
+        viewModelScope.launch { tagCatalog.collect { if (app.unlocked.value) reconcileTags() } }
         viewModelScope.launch { repository.issue.collect { issue -> if (issue != null) { error = issue; repository.issue.value = null } } }
         viewModelScope.launch { repository.notes.collect {
             if (app.unlocked.value) runCatching { reloadAttachments() }
@@ -74,9 +104,10 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
             if (!unlocked) {
                 operations.toList().forEach { it.cancel() }; searchJob?.cancel(); backups.discard()
                 note = null; attachments = emptyMap(); results = emptyList(); query = ""; hit = null
+                clearFind(); filter = NoteFilter(); listAnchor = null; listOffset = 0
                 history.clear(); historyRevision++; screen = Screen.LIST; editing = false
                 busy = null; passwordMode = null; restoreCount = null; setupWords = null; revealedWords = null; replaceBackup = null
-            } else { keyUnavailable = false; reloadAttachments() }
+            } else { keyUnavailable = false; reconcileTags(); reloadAttachments() }
         } }
         viewModelScope.launch { repository.passphraseConfirmed.collect { confirmed ->
             setupWords = null
@@ -97,11 +128,16 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     fun progress(message: String) { app.scope.launch { if (operation?.isActive == true && app.unlocked.value) busy = message } }
     fun cancelOperation() { activeOperation?.cancel(); busy = null }
     suspend fun reloadAttachments() { attachments = repository.attachments() }
-    fun create() {
-        note = Note(); newDraft = true; editing = true; focusTitle = true; bodyFocus = null
+    fun create() = createDraft(inheritTag = true)
+    private fun createDraft(inheritTag: Boolean) {
+        clearFind()
+        rememberEditorSelection(HitKind.TITLE, 0)
+        note = Note(tagIds = if (inheritTag) listOfNotNull(filter.tagId) else emptyList()); newDraft = true; editing = true; focusTitle = true; bodyFocus = null
         history.clear(); historyRevision++; hit = null; screen = Screen.NOTE
     }
     fun open(value: Note, match: SearchHit? = null) {
+        clearFind()
+        rememberEditorSelection(HitKind.TITLE, 0)
         note = value; newDraft = false; editing = false; focusTitle = false; bodyFocus = null
         history.clear(); historyRevision++; hit = match; screen = Screen.NOTE
     }
@@ -111,12 +147,27 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
         if (old == value) return
         if (record && editing) history.record(old, typing)
         historyRevision++
-        val updated = value.copy(updatedAt = maxOf(System.currentTimeMillis(), old.updatedAt + 1))
-        try { repository.enqueue(updated, !newDraft); note = updated }
+        val updated = value.copy(updatedAt = maxOf(System.currentTimeMillis(), old.updatedAt + 1), tagIds = value.tagIds.filter { id -> tags.any { it.id == id } }.distinct())
+        try {
+            repository.enqueue(updated, !newDraft); note = updated
+            if (old.title != updated.title || old.document.text != updated.document.text) {
+                if (findOpen) computeFind(jump = false)
+            }
+        }
         catch (_: CancellationException) { app.lock() }
     }
     fun editBody(document: Document, typing: Boolean) { note?.let { change(it.copy(document = document), typing = typing) } }
-    fun setChecked(line: Int, checked: Boolean) { note?.let { change(it.copy(document = DocumentEdits.setChecked(it.document, line, checked))) } }
+    /** Edits applied without a field callback, including history replay. Metadata alone does not move the cursor. */
+    private fun changeEditorContent(value: Note, record: Boolean = true) {
+        val old = note ?: return
+        change(value, record)
+        val current = note ?: return
+        if (old.title != current.title || old.document.text != current.document.text ||
+            old.document.lines != current.document.lines || old.document.bold != current.document.bold) {
+            editorInteracted(editorSelection.field, editorSelection.start, editorSelection.end)
+        }
+    }
+    fun setChecked(line: Int, checked: Boolean) { note?.let { changeEditorContent(it.copy(document = DocumentEdits.setChecked(it.document, line, checked))) } }
     fun moveAttachment(id: String, delta: Int) {
         val n = note ?: return
         val list = n.document.attachments
@@ -127,24 +178,33 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     fun removeAttachment(id: String) { note?.let { n -> change(n.copy(document = n.document.copy(attachments = n.document.attachments - id))) } }
     fun reorderNotes(ids: List<String>, finished: () -> Unit = {}) {
         task(null, "The note order could not be saved.") {
-            try { repository.reorder(ids) } finally { finished() }
+            try { repository.reorderVisible(ids) } finally { finished() }
         }
     }
-    fun undo() { note?.let { n -> history.undo(n)?.let { change(it, false) } } }
-    fun redo() { note?.let { n -> history.redo(n)?.let { change(it, false) } } }
+    fun undo() { note?.let { n -> history.undo(n)?.let { changeEditorContent(it, false) } } }
+    fun redo() { note?.let { n -> history.redo(n)?.let { changeEditorContent(it, false) } } }
     /** Enters editing with the cursor in the title, or in the body at [bodyOffset]. */
-    fun enterEditing(bodyOffset: Int? = null) { editing = true; focusTitle = bodyOffset == null; bodyFocus = bodyOffset }
+    fun enterEditing(bodyOffset: Int? = null) {
+        editorInteracted(if (bodyOffset == null) HitKind.TITLE else HitKind.BODY, bodyOffset ?: 0)
+        editing = true; focusTitle = bodyOffset == null; bodyFocus = bodyOffset
+    }
     suspend fun flush() = repository.flush()
     fun back() {
+        if (screen == Screen.NOTE && findOpen) { closeFind(); return }
         if (screen == Screen.IMAGE) { imageId = null; screen = Screen.NOTE; return }
         if (screen != Screen.NOTE) { screen = Screen.LIST; query = ""; results = emptyList(); choosingDestination = false; return }
+        leaveNote()
+    }
+    /** Done finishes editing in one action even when Find is open. Failed saves retain editing. */
+    fun finishEditing() { clearFind(); focusTitle = false; bodyFocus = null; leaveNote() }
+    private fun leaveNote() {
         task(null, "Changes could not be saved. Please free some storage before leaving this note.") {
             flush()
             val discard = newDraft && note?.isEmpty == true
             if (discard) note?.let { repository.delete(it.id) }
             endSession()
             if (editing && !discard) { editing = false; focusTitle = false; bodyFocus = null }
-            else { screen = Screen.LIST; note = null }
+            else { clearFind(); screen = Screen.LIST; note = null }
         }
     }
     private suspend fun endSession() {
@@ -155,14 +215,15 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
         val id = note?.id ?: return
         task("Deleting note…", "The note could not be deleted.") {
             flush()
-            repository.delete(id); history.clear(); note = null; screen = Screen.LIST; reloadAttachments()
+            repository.delete(id); clearFind(); history.clear(); note = null; screen = Screen.LIST; reloadAttachments()
         }
     }
     fun search(value: String) {
         query = value; searchJob?.cancel()
+        val selected = if (choosingDestination) NoteFilter() else filter
         searchJob = viewModelScope.launch {
             delay(150)
-            try { results = repository.search(value) } catch (_: CancellationException) { } catch (_: Exception) { error = "Search could not be completed." }
+            try { results = repository.search(value, selected) } catch (_: CancellationException) { } catch (_: Exception) { error = "Search could not be completed." }
         }
     }
     fun import(uris: List<Uri>, mime: String? = null) {
@@ -202,10 +263,10 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     fun acceptShare(destination: Note?) {
         val incoming = share ?: return
         share = null; choosingDestination = false
-        if (destination == null) create() else { open(destination); editing = true }
+        if (destination == null) createDraft(inheritTag = false) else { open(destination); editing = true }
         incoming.text?.takeIf { it.isNotBlank() }?.let { text ->
             val n = note!!
-            change(n.copy(document = DocumentEdits.appendText(n.document, text)))
+            changeEditorContent(n.copy(document = DocumentEdits.appendText(n.document, text)))
         }
         if (incoming.uris.isNotEmpty()) import(incoming.uris, incoming.mime)
     }
@@ -246,9 +307,72 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     fun restore() {
         restoreCount = null
         task("Replacing notes…", "Restore could not be completed. Existing data has been retained where possible.") {
-            backups.commit(); reloadAttachments(); screen = Screen.LIST; app.startIndexing()
+            backups.commit(); clearFind(); note = null; filter = NoteFilter(); reloadAttachments(); screen = Screen.LIST; app.startIndexing()
         }
     }
     fun cancelRestore() { backups.discard(); restoreCount = null }
+    fun selectFilter(value: NoteFilter) {
+        filter = value; listAnchor = null; listOffset = 0
+        if (screen == Screen.SEARCH) search(query)
+    }
+    fun assignTag(id: String, assigned: Boolean) {
+        note?.let { change(it.copy(tagIds = if (assigned) (it.tagIds + id).distinct() else it.tagIds - id)) }
+    }
+    private fun reconcileTags() {
+        if (!app.unlocked.value) return
+        val ids = tags.map { it.id }.toSet()
+        if (filter.tagId != null && filter.tagId !in ids) selectFilter(NoteFilter())
+        note = note?.let { it.copy(tagIds = it.tagIds.filter(ids::contains)) }
+        if (history.hasTagsOutside(ids)) { history.clear(); historyRevision++ }
+    }
+    suspend fun createTag(name: String): Tag = repository.createTag(name)
+    suspend fun renameTag(id: String, name: String) { repository.renameTag(id, name) }
+    suspend fun deleteTag(id: String) { repository.deleteTag(id); reconcileTags() }
+
+    fun rememberEditorSelection(field: HitKind, start: Int, end: Int = start) {
+        editorSelection = EditorSelection(field, start.coerceAtLeast(0), end.coerceAtLeast(0))
+    }
+    fun editorInteracted(field: HitKind, start: Int, end: Int = start) {
+        rememberEditorSelection(field, start, end); editorRevision++
+        finder.cancelScroll(); findScrollTarget = null; findScrollRevision++; findReturn = null
+    }
+    fun openFind() {
+        clearFind(); findActionRevision = editorRevision
+        findOpen = true; focusTitle = false; bodyFocus = null
+    }
+    fun findQuery(value: String) {
+        findActionRevision = editorRevision; findScrollTarget = null; findScrollRevision++
+        computeFind(jump = true, query = value)
+    }
+    private fun computeFind(jump: Boolean, query: String = find.query) {
+        val snapshot = note ?: return
+        finder.search(snapshot.title, snapshot.document.text, query, jump)
+    }
+    fun moveFind(delta: Int) {
+        if (find.pending || find.matches.isEmpty()) return
+        findActionRevision = editorRevision; finder.move(delta)
+    }
+    fun closeFind() {
+        if (!findOpen) return
+        val id = note?.id; val revision = editorRevision
+        val useResult = editing && findActionRevision == revision
+        val fallback = editorSelection
+        findOpen = false; findScrollTarget = null; findScrollRevision++
+        finder.close(resolve = useResult) { result ->
+            if (app.unlocked.value && note?.id == id && editorRevision == revision && !findOpen) {
+                findReturn = if (editing) result.active?.takeIf { useResult }?.let { EditorSelection(it.kind, it.start) } ?: fallback else null
+                returnRevision = revision; findCloseRevision++
+            }
+        }
+    }
+    fun consumeFindReturn(): EditorSelection? {
+        val result = findReturn.takeIf { returnRevision == editorRevision && !findOpen && editing && app.unlocked.value }
+        findReturn = null
+        return result
+    }
+    private fun clearFind() {
+        finder.clear(); findOpen = false; findReturn = null
+        findScrollTarget = null; findScrollRevision++
+    }
     override fun onCleared() { backups.discard() }
 }
