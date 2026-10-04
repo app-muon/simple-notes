@@ -249,7 +249,9 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     suspend fun recoverCamera() {
         operation?.join()
         if (!app.unlocked.value) return
-        task("Importing photo…", "The photo could not be imported. Unlock again to retry, or discard the unfinished capture.") {
+        // Every unlock runs this check; only a photo returned by the camera is an import worth announcing.
+        val message = if (app.camera.hasResult()) "Importing photo…" else null
+        task(message, "The photo could not be imported. Unlock again to retry, or discard the unfinished capture.") {
             app.camera.cleanOrphans()
             cameraRecovery = app.camera.hasPending()
             if (app.camera.hasResult()) {

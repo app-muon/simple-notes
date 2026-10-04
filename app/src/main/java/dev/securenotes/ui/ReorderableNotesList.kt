@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.dp
 import dev.securenotes.document.Note
 import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
+import kotlin.time.Duration.Companion.milliseconds
 
 @Composable
 internal fun ReorderableNotesList(
@@ -60,7 +61,7 @@ internal fun ReorderableNotesList(
     // The gesture belongs to the list, so scrolling the source row offscreen cannot cancel it.
     LaunchedEffect(draggedId) {
         if (draggedId != null) while (true) {
-            delay(16)
+            delay(16.milliseconds)
             val layout = state.layoutInfo
             val amount = when {
                 pointerY < layout.viewportStartOffset + edge -> -((layout.viewportStartOffset + edge - pointerY) / 5).coerceAtMost(edge / 3)

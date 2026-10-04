@@ -1,15 +1,13 @@
-@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class, androidx.compose.ui.ExperimentalComposeUiApi::class, androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@file:OptIn(ExperimentalMaterial3Api::class, androidx.compose.ui.ExperimentalComposeUiApi::class, ExperimentalLayoutApi::class)
 package dev.securenotes.ui
 
 import android.app.KeyguardManager
 import android.graphics.Bitmap
-import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.*
-import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -45,7 +43,6 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.TransformedText
 import androidx.compose.ui.text.input.OffsetMapping
 import androidx.compose.ui.text.input.VisualTransformation
-import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -54,26 +51,20 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.*
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.zIndex
-import androidx.core.content.FileProvider
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.securenotes.R
 import dev.securenotes.document.*
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import java.io.File
+import kotlin.time.Duration.Companion.milliseconds
 
 @Composable
 fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: () -> Unit, openFile: (String) -> Unit, recover: (CharArray) -> Unit = {}, reveal: () -> Unit = {}) {
@@ -334,7 +325,7 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
             HitKind.TITLE -> {
                 titleValue = titleValue.copy(selection = TextRange(match.start.coerceAtMost(note.title.length)))
                 if (vm.editing) 0 else {
-                    val layout = withTimeoutOrNull(1_000) { snapshotFlow { titleLayout }.filterNotNull().first() }
+                    val layout = withTimeoutOrNull(1_000.milliseconds) { snapshotFlow { titleLayout }.filterNotNull().first() }
                     titleTop + (layout?.getBoundingBox(visibleTitle.visibleOffset(match.start))?.top?.toInt() ?: 0)
                 }
             }
@@ -342,7 +333,7 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
                 bodyTop + (editor?.matchRect(match.start)?.top ?: 0)
             } else {
                 val line = DocumentEdits.lineAt(note.document.text, match.start)
-                val layout = withTimeoutOrNull(1_000) { snapshotFlow { lineLayouts[line] }.filterNotNull().first() }
+                val layout = withTimeoutOrNull(1_000.milliseconds) { snapshotFlow { lineLayouts[line] }.filterNotNull().first() }
                 val offset = (match.start - DocumentEdits.lineStart(note.document.text, line))
                     .coerceIn(0, (layout?.layoutInput?.text?.length?.minus(1) ?: 0).coerceAtLeast(0))
                 val matchTop = (lineTops[line] ?: 0) + (layout?.getBoundingBox(offset)?.top?.toInt() ?: 0)
@@ -361,7 +352,7 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
                 HitKind.TITLE -> 0
                 HitKind.BODY -> {
                     val line = DocumentEdits.lineAt(note.document.text, hit.start)
-                    withTimeoutOrNull(1_000) { snapshotFlow { rowTops[line] }.filterNotNull().first() } ?: 0
+                    withTimeoutOrNull(1_000.milliseconds) { snapshotFlow { rowTops[line] }.filterNotNull().first() } ?: 0
                 }
                 HitKind.ATTACHMENT -> attachmentsTop
             }
