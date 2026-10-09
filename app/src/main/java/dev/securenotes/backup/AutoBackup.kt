@@ -37,6 +37,10 @@ class AutoBackup(private val context: Context, private val repository: NotesRepo
     private class IncompleteWrite : Exception()
     val status = MutableStateFlow<Status?>(null)
     private val running = Mutex()
+    /** The [NotesRepository.changes] count the destination is known to hold; null when unknown. */
+    @Volatile private var savedChange: Long? = null
+    /** False when the destination already holds the current content, so leaving the app needs nothing kept running. */
+    fun mayWrite(pendingEdits: Boolean) = status.value?.location != null && (pendingEdits || repository.changes.value != savedChange)
     /** True when [uri] already holds a Notes backup, which choosing it as the destination would overwrite. */
     suspend fun containsBackup(uri: Uri): Boolean = withContext(Dispatchers.IO) {
         try { context.contentResolver.openInputStream(uri)?.use { BackupCodec.validateHeader(it); true } ?: false }
@@ -75,23 +79,31 @@ class AutoBackup(private val context: Context, private val repository: NotesRepo
     /** Writes a new backup when content changed since the last successful one (or always, when [force]). */
     suspend fun run(force: Boolean = false, progress: (String) -> Unit = {}) {
         running.withLock {
+            val change = repository.changes.value
             val (uri, last) = repository.access { v -> v.text(URI)?.let(Uri::parse) to v.text(FINGERPRINT) }
             var unrecorded: String? = null
+            // Shown with unexpected failures so a provider problem can be diagnosed without device logs.
+            var step = "encrypt"
             if (uri != null) try {
                 if (context.contentResolver.persistedUriPermissions.none { it.uri == uri && it.isWritePermission }) throw LostPermission()
                 val created = backups.create(progress, if (force) null else last)
                 if (created != null) {
                     val (file, fingerprint) = created
                     // The file is already ciphertext, so finishing the copy after a lock leaks nothing and avoids a truncated backup.
-                    try { withContext(NonCancellable + Dispatchers.IO) { write(uri, file) } } finally { file.delete() }
+                    try { withContext(NonCancellable + Dispatchers.IO) { write(uri, file) { step = it } } } finally { file.delete() }
+                    step = "record"
                     repository.access { v -> v.put(FINGERPRINT, fingerprint); v.put(SAVED_AT, System.currentTimeMillis().toString()); v.dao.deleteSecret(ERROR) }
                 }
+                savedChange = change
             } catch (e: CancellationException) { throw e }
             catch (e: Exception) {
+                savedChange = null
                 val message = when (e) {
                     is LostPermission, is SecurityException -> "Notes can no longer write to the backup file. Choose the backup location again."
                     is IncompleteWrite -> "This backup location didn't replace the previous backup cleanly, so the file may not restore. Choose a different backup file or location."
-                    else -> "The latest automatic backup could not be saved. Check the backup location and available storage."
+                    // Exception types only: messages can contain file names or URIs.
+                    else -> "The latest automatic backup could not be saved. Check the backup location and available storage. " +
+                        "(Failed at $step: ${e.javaClass.simpleName}${e.cause?.let { " / " + it.javaClass.simpleName } ?: ""})"
                 }
                 // Recording the failure can itself fail (for example on a full disk); then it is shown from memory.
                 try { repository.access { v -> v.put(ERROR, message) } }
@@ -101,13 +113,18 @@ class AutoBackup(private val context: Context, private val repository: NotesRepo
             unrecorded?.let { message -> status.value = (status.value ?: Status(null, null, null)).copy(error = message) }
         }
     }
-    private fun write(uri: Uri, file: File) {
+    private fun write(uri: Uri, file: File, step: (String) -> Unit) {
         val resolver = context.contentResolver
-        // Prefer modes that truncate. Some providers only accept plain "w", which may not truncate, so check the result.
-        val output = listOf("wt", "rwt").firstNotNullOfOrNull { mode -> runCatching { resolver.openOutputStream(uri, mode) }.getOrNull() }
-            ?: resolver.openOutputStream(uri, "w")
-        checkNotNull(output).use { out -> file.inputStream().use { it.copyTo(out, 64 * 1024) } }
-        // Old bytes left after a shorter backup would make the file fail authentication on restore.
+        // Prefer modes that truncate; accepting one is the provider's promise to replace the old backup. Reading back is then
+        // skipped because providers that upload after close (e.g. Dropbox) still report the previous copy's size.
+        step("open")
+        val (mode, output) = listOf("wt", "rwt").firstNotNullOfOrNull { m -> runCatching { resolver.openOutputStream(uri, m) }.getOrNull()?.let { m to it } }
+            ?: ("w" to checkNotNull(resolver.openOutputStream(uri, "w")))
+        step("write $mode")
+        output.use { out -> file.inputStream().use { it.copyTo(out, 64 * 1024) }; step("close $mode") }
+        if (mode != "w") return
+        step("verify")
+        // Plain "w" may not truncate, and old bytes left after a shorter backup would make the file fail authentication on restore.
         val size = runCatching { resolver.openFileDescriptor(uri, "r")?.use { it.statSize } }.getOrNull() ?: -1L
         if (size >= 0 && size != file.length()) throw IncompleteWrite()
     }

@@ -740,6 +740,21 @@ class UiFlowTest {
         assertNull(app.autoBackup.status.value?.location)
         assertTrue(File(app.cacheDir, "backups").listFiles().orEmpty().isEmpty())
     }
+    @Test fun keepAliveRunsAForegroundServiceOnlyUntilReleased() {
+        compose.setContent { SecureNotesApp(vm, {}, {}, {}) }
+        val activities = app.getSystemService(android.app.ActivityManager::class.java)
+        @Suppress("DEPRECATION") // Still lists the caller's own services.
+        fun service() = activities.getRunningServices(Int.MAX_VALUE).firstOrNull { it.service.className == dev.securenotes.backup.BackupKeepAlive::class.java.name }
+        val first = compose.runOnUiThread { app.keepAlive() }
+        val second = compose.runOnUiThread { app.keepAlive() }
+        compose.waitUntil(10_000) { service()?.foreground == true }
+        compose.runOnUiThread { first(); first() } // Releasing twice must not drop the other hold.
+        Thread.sleep(500)
+        assertEquals(true, service()?.foreground)
+        compose.runOnUiThread { second() }
+        compose.waitUntil(10_000) { service() == null }
+        assertEquals(0, app.keptAlive.value)
+    }
     @Test fun authenticationGateDoesNotRenderNotes() {
         compose.setContent { SecureNotesApp(vm, {}, {}, {}) }
         compose.onNodeWithText("Notes").assertIsDisplayed()

@@ -575,6 +575,8 @@ private fun annotatedLine(document: Document, start: Int, end: Int, match: dev.s
                 OutlinedButton(onClick = chooseBackup, modifier = Modifier.fillMaxWidth()) { Text("Change backup file") }
                 TextButton(onClick = vm::turnOffBackup, modifier = Modifier.fillMaxWidth()) { Text("Turn off automatic backup") }
             }
+            // Dropbox delayed or refused repeated writes to the same file until its battery use was unrestricted.
+            Text("If the backup file is in Dropbox or a similar app, set that app's battery use to Unrestricted in Android Settings → Apps. Otherwise it may delay or refuse backups.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             OutlinedButton(onClick = restore, modifier = Modifier.fillMaxWidth()) { Text("Restore from backup") }
             Spacer(Modifier.height(16.dp)); Text("${stringResource(R.string.app_name)} · ${dev.securenotes.BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }

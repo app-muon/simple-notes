@@ -295,16 +295,16 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
         if (uri == null) return
         task("Checking backup file…", unusableLocation) {
             if (app.autoBackup.containsBackup(uri)) replaceBackup = uri
-            else { flush(); app.autoBackup.choose(uri) }
+            else app.keepAlive { flush(); app.autoBackup.choose(uri) }
         }
     }
     fun confirmReplaceBackup() {
         val uri = replaceBackup ?: return
         replaceBackup = null
-        task("Saving encrypted backup…", unusableLocation) { flush(); app.autoBackup.choose(uri) }
+        task("Saving encrypted backup…", unusableLocation) { app.keepAlive { flush(); app.autoBackup.choose(uri) } }
     }
     fun restoreChosenBackup() { val uri = replaceBackup ?: return; replaceBackup = null; selectRestore(uri) }
-    fun backupNow() { task("Saving encrypted backup…", "The backup could not be saved.") { flush(); app.autoBackup.run(force = true, progress = ::progress) } }
+    fun backupNow() { task("Saving encrypted backup…", "The backup could not be saved.") { app.keepAlive { flush(); app.autoBackup.run(force = true, progress = ::progress) } } }
     fun turnOffBackup() { task(null, "Automatic backup settings could not be saved.") { app.autoBackup.turnOff() } }
     fun restore() {
         restoreCount = null

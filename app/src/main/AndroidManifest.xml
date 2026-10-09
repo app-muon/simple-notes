@@ -1,5 +1,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <!-- Lets a backup finish after the user leaves the app (shortService type: no extra permission, about 3 minutes). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.INTERNET" tools:node="remove" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" tools:node="remove" />
     <application android:name=".NotesApplication" android:label="@string/app_name"
@@ -20,6 +22,8 @@
                 <data android:mimeType="*/*" />
             </intent-filter>
         </activity>
+        <service android:name=".backup.BackupKeepAlive" android:exported="false"
+            android:foregroundServiceType="shortService" />
         <provider android:name=".storage.AttachmentProvider" android:authorities="${applicationId}.attachments"
             android:exported="false" android:grantUriPermissions="true" />
         <provider android:name="androidx.core.content.FileProvider" android:authorities="${applicationId}.camera"

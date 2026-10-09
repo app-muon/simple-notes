@@ -1,6 +1,22 @@
-# Verification — 4 October 2026
+# Verification — 9 October 2026
 
-## Find checklist and cursor-priority follow-up: current source 1.0.2 (3)
+## Automatic backup to Dropbox: current source 1.0.2 (3)
+
+Automatic backups to a Dropbox file on the owner's phone failed three ways. They were diagnosed from the phone's Settings messages and from the synced desktop Dropbox folder, polled every 0.5 s for size and leading bytes; no device logs were used.
+
+- Reading the size back after a truncating write saw Dropbox's previous copy until its upload finished. Successful saves were therefore reported as incomplete and retried at every trigger. The read-back now runs only after the non-truncating `"w"` fallback.
+- Android froze the app seconds after it was left, so a save started on leaving finished only when the app was reopened. A `shortService` foreground service (`BackupKeepAlive`) now holds the process while a save that needs writing runs on leaving, and during "Back up now" and choosing a file.
+- While Dropbox's battery use was optimised, only the first save into a newly created file was reliable. Later saves to the same file were replaced, uploaded as `<name>_<number>.ssnb` copies, or failed at `write wt: IOException / ErrnoException`; one refused save was uploaded about 20 minutes later. A file in Downloads accepted repeated saves. With Dropbox set to Unrestricted, two "Back up now" saves and a save after leaving the app each replaced the same file within seconds, with no empty or renamed intermediate. Settings now recommends that setting, and unexpected failures show the failed step and exception types (never messages, which can contain names).
+
+Results:
+
+- JVM unit tests: **56 passed**. Debug lint: **0 errors, 9 existing advisory warnings**, none in changed code. `git diff --check`: **passed**.
+- Full UI and storage instrumentation: **59 passed**, including a new test that `keepAlive` runs `BackupKeepAlive` in the foreground until every hold is released. An earlier run on the emulator without its test PIN failed only `graceResumesAfterRepeatedLocks`, which needs the PIN.
+- Physical phone with Dropbox: as above. Not yet checked: behaviour after a reboot or long idle, leaving by swiping from Recents, and restoring from the Dropbox copy.
+
+Tests used synthetic vaults on a disposable, headless, read-only Pixel 8 emulator (Android 17 / API 37, emulator-5580) with a test PIN. Artifacts are under `%TEMP%\secure-notes-build-2` (`app/outputs/apk`, `app/reports/tests/testDebugUnitTest`, `app/reports/lint-results-debug.html`, `app/reports/androidTests/connected/debug`). The signed `dist` release was not replaced.
+
+## Find checklist and cursor-priority follow-up: source 1.0.2 (3)
 
 Find now keeps the full checkbox visible for matches on a checklist's first visual line while retaining text-based scrolling for deep wrapped matches. Tag assignments and tag-only history preserve Find's cursor destination; text/formatting history and checkbox edits count as editor interactions. Removed redundant saved-selection state and used the tested title-clipping helper in reading-mode rendering. Text changes still invalidate highlights while the replacement search is pending. Room remains at schema 2 and backup manifests at version 3.
 

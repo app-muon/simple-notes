@@ -4,6 +4,7 @@ import android.app.Application
 import android.app.KeyguardManager
 import android.content.*
 import dev.securenotes.backup.AutoBackup
+import dev.securenotes.backup.BackupKeepAlive
 import dev.securenotes.backup.BackupService
 import dev.securenotes.security.DeviceKeys
 import dev.securenotes.security.Passphrase
@@ -12,6 +13,7 @@ import dev.securenotes.storage.NotesRepository
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.CancellationException
@@ -53,6 +55,20 @@ class NotesApplication : Application() {
     fun beginRecovery(root: ByteArray) { clearRecovery(); pendingRecovery = root }
     fun clearRecovery() { pendingRecovery?.fill(0); pendingRecovery = null }
     val grants: MutableSet<android.net.Uri> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+    /** Saves that must finish even if the user leaves the app; [BackupKeepAlive] runs while this is above zero. */
+    val keptAlive = MutableStateFlow(0)
+    /**
+     * Holds the process open with [BackupKeepAlive] until the returned function is called. Android freezes an app within
+     * seconds of the user leaving it, and allows this only while the app is still visible.
+     */
+    fun keepAlive(): () -> Unit {
+        keptAlive.update { it + 1 }
+        try { startForegroundService(Intent(this, BackupKeepAlive::class.java)) }
+        catch (_: Exception) { /* Not allowed now; the save still finishes whenever the process next runs. */ }
+        val released = java.util.concurrent.atomic.AtomicBoolean()
+        return { if (released.compareAndSet(false, true)) keptAlive.update { it - 1 } }
+    }
+    suspend fun <T> keepAlive(block: suspend () -> T): T { val release = keepAlive(); try { return block() } finally { release() } }
     override fun onCreate() {
         super.onCreate()
         System.loadLibrary("sqlcipher")
@@ -135,9 +151,15 @@ class NotesApplication : Application() {
         closing = scope.launch { sessionMutex.withLock { repository.close() } }
     }
     /** Flushes edits, then refreshes the automatic backup if content changed (backgrounding is a natural checkpoint). */
-    fun flushEdits() { if (unlocked.value) scope.launch {
-        try { repository.flush() } catch (_: CancellationException) { return@launch } catch (_: Exception) { repository.issue.value = "Recent changes could not be saved. Free storage and retry."; return@launch }
-        try { autoBackup.run() } catch (_: Exception) { /* Locked or recorded in the backup status. */ }
+    fun flushEdits() { if (unlocked.value) {
+        // Called while still visible, the last chance to keep the process running; skipped when nothing needs writing.
+        val release = if (autoBackup.mayWrite(repository.hasPendingEdits())) keepAlive() else null
+        scope.launch {
+            try {
+                try { repository.flush() } catch (_: CancellationException) { return@launch } catch (_: Exception) { repository.issue.value = "Recent changes could not be saved. Free storage and retry."; return@launch }
+                try { autoBackup.run() } catch (_: Exception) { /* Locked or recorded in the backup status. */ }
+            } finally { release?.invoke() }
+        }
     } }
     @OptIn(kotlinx.coroutines.FlowPreview::class)
     private fun startAutoBackup() {

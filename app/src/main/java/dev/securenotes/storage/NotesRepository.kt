@@ -66,6 +66,7 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
         pending.put(PendingEdit(note, preserveEmpty))
     }
     suspend fun flush() = access { flushAccepted(it) }
+    fun hasPendingEdits() = pending.snapshot().isNotEmpty()
     /** Only previously accepted snapshots can be written here after the session is revoked. */
     suspend fun close() {
         freezeEdits()
