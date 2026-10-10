@@ -1,12 +1,20 @@
-# Verification — 9 October 2026
+# Verification — 10 October 2026
 
-## Automatic backup to Dropbox: current source 1.0.2 (3)
+## Dropbox follow-up, 10 October: current source 1.0.2 (3)
+
+The 9 October advice to set the provider app's battery use to Unrestricted was disproven later that day (see below), and the save refused at about 11:00 never reached Dropbox, even overnight. Settings, the README, the acceptance checklist and `encrypted_backup_tips.md` now recommend a phone-storage file uploaded by a sync app for dependable Dropbox backups. The write now tries `"rwt"` before `"wt"`, because read/write modes imply a seekable file while `"wt"` may be a pipe. Unexpected failures now include the errno name after the exception type.
+
+- Owner's phone, with Dropbox idle overnight and not opened during the test: the save on opening Notes, two "Back up now" taps, and a save after 15 minutes idle and leaving the app all failed with `(Failed at write rwt: IOException / ErrnoException EBADF)`. Nothing reached Dropbox; `Notes-new.ssnb` stayed at its 9 October 10:47 version. Dropbox accepts `"rwt"` but returns a descriptor that cannot be written, so `"rwt"` does not fix direct Dropbox saves. The 9 October `write wt` failures predate the errno name, so their code is unknown.
+- JVM unit tests: **56 passed**. Debug lint: **0 errors, 9 existing advisory warnings**, none in changed code. `git diff --check`: **passed**.
+- Full UI and storage instrumentation: **59 passed** on the same emulator with its test PIN.
+
+## Automatic backup to Dropbox, 9 October: source 1.0.2 (3)
 
 Automatic backups to a Dropbox file on the owner's phone failed three ways. They were diagnosed from the phone's Settings messages and from the synced desktop Dropbox folder, polled every 0.5 s for size and leading bytes; no device logs were used.
 
 - Reading the size back after a truncating write saw Dropbox's previous copy until its upload finished. Successful saves were therefore reported as incomplete and retried at every trigger. The read-back now runs only after the non-truncating `"w"` fallback.
 - Android froze the app seconds after it was left, so a save started on leaving finished only when the app was reopened. A `shortService` foreground service (`BackupKeepAlive`) now holds the process while a save that needs writing runs on leaving, and during "Back up now" and choosing a file.
-- While Dropbox's battery use was optimised, only the first save into a newly created file was reliable. Later saves to the same file were replaced, uploaded as `<name>_<number>.ssnb` copies, or failed at `write wt: IOException / ErrnoException`; one refused save was uploaded about 20 minutes later. A file in Downloads accepted repeated saves. With Dropbox set to Unrestricted, two "Back up now" saves and a save after leaving the app each replaced the same file within seconds, with no empty or renamed intermediate. Settings now recommends that setting, and unexpected failures show the failed step and exception types (never messages, which can contain names).
+- While Dropbox's battery use was optimised, only the first save into a newly created file was reliable. Later saves to the same file were replaced, uploaded as `<name>_<number>.ssnb` copies, or failed at `write wt: IOException / ErrnoException`; one refused save was uploaded about 20 minutes later. A file in Downloads accepted repeated saves. With Dropbox set to Unrestricted and just opened, two "Back up now" saves and a save after leaving the app each replaced the same file within seconds, with no empty or renamed intermediate. About 13 minutes later, with Dropbox idle, the next save failed at `write wt` again, so that setting does not fix it: repeated overwrites succeeded only shortly after the Dropbox app or picker had been on screen. (The Settings advice added that day was corrected on 10 October.) Unexpected failures show the failed step and exception types (never messages, which can contain names).
 
 Results:
 

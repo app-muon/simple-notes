@@ -101,9 +101,9 @@ class AutoBackup(private val context: Context, private val repository: NotesRepo
                 val message = when (e) {
                     is LostPermission, is SecurityException -> "Notes can no longer write to the backup file. Choose the backup location again."
                     is IncompleteWrite -> "This backup location didn't replace the previous backup cleanly, so the file may not restore. Choose a different backup file or location."
-                    // Exception types only: messages can contain file names or URIs.
+                    // Exception types and errno names only: messages can contain file names or URIs.
                     else -> "The latest automatic backup could not be saved. Check the backup location and available storage. " +
-                        "(Failed at $step: ${e.javaClass.simpleName}${e.cause?.let { " / " + it.javaClass.simpleName } ?: ""})"
+                        "(Failed at $step: ${describe(e)}${e.cause?.let { " / " + describe(it) } ?: ""})"
                 }
                 // Recording the failure can itself fail (for example on a full disk); then it is shown from memory.
                 try { repository.access { v -> v.put(ERROR, message) } }
@@ -113,12 +113,16 @@ class AutoBackup(private val context: Context, private val repository: NotesRepo
             unrecorded?.let { message -> status.value = (status.value ?: Status(null, null, null)).copy(error = message) }
         }
     }
+    private fun describe(e: Throwable) = e.javaClass.simpleName +
+        ((e as? android.system.ErrnoException)?.let { " " + (android.system.OsConstants.errnoName(it.errno) ?: it.errno.toString()) } ?: "")
     private fun write(uri: Uri, file: File, step: (String) -> Unit) {
         val resolver = context.contentResolver
         // Prefer modes that truncate; accepting one is the provider's promise to replace the old backup. Reading back is then
         // skipped because providers that upload after close (e.g. Dropbox) still report the previous copy's size.
+        // "rwt" comes first because read/write modes imply a seekable file, whereas "wt" may be a pipe: Dropbox opened
+        // "wt" and then failed mid-write. Fallback happens only when opening fails, never after a failed write.
         step("open")
-        val (mode, output) = listOf("wt", "rwt").firstNotNullOfOrNull { m -> runCatching { resolver.openOutputStream(uri, m) }.getOrNull()?.let { m to it } }
+        val (mode, output) = listOf("rwt", "wt").firstNotNullOfOrNull { m -> runCatching { resolver.openOutputStream(uri, m) }.getOrNull()?.let { m to it } }
             ?: ("w" to checkNotNull(resolver.openOutputStream(uri, "w")))
         step("write $mode")
         output.use { out -> file.inputStream().use { it.copyTo(out, 64 * 1024) }; step("close $mode") }
