@@ -21,9 +21,9 @@ class BackupKeepAlive : Service() {
     override fun onBind(intent: Intent?) = null
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val notifications = getSystemService(NotificationManager::class.java)
-        notifications.createNotificationChannel(NotificationChannel(CHANNEL, "Backup", NotificationManager.IMPORTANCE_LOW))
+        notifications.createNotificationChannel(NotificationChannel(CHANNEL, "Backup", NotificationManager.IMPORTANCE_MIN).apply { setSound(null, null); enableVibration(false); setShowBadge(false) })
         val notification = Notification.Builder(this, CHANNEL).setSmallIcon(android.R.drawable.stat_notify_sync)
-            .setContentTitle("Saving encrypted backup").setOngoing(true).build()
+            .setContentTitle("Saving encrypted backup").setOngoing(true).setOnlyAlertOnce(true).setCategory(Notification.CATEGORY_SERVICE).build()
         // Required promptly after startForegroundService, even when the save has already finished.
         startForeground(NOTIFICATION, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE)
         val app = application as NotesApplication
@@ -36,7 +36,7 @@ class BackupKeepAlive : Service() {
     override fun onTimeout(startId: Int, fgsType: Int) { stopSelf() }
     override fun onDestroy() { waiting?.cancel(); super.onDestroy() }
     private companion object {
-        const val CHANNEL = "backup"
+        const val CHANNEL = "verified-backup"
         const val NOTIFICATION = 1
     }
 }

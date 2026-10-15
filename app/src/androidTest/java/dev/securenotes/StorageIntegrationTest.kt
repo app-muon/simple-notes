@@ -121,6 +121,63 @@ class StorageIntegrationTest {
         assertEquals(listOf(tag.id), repository.notes.value.single().tagIds)
     }
     private val otherPhrase = "vertigo unbundle skipping pyramid motion greedily driven cherisher"
+    @Test fun fingerprintsIgnoreIndexingAndCanonicalizeMetadataButIncludePhraseAndManualOrder() = runBlocking {
+        repository.confirmPassphrase()
+        val a = repository.createTag("A"); val b = repository.createTag("B")
+        val first = repository.import(Note(title = "First", tagIds = listOf(a.id, b.id)), source("index.txt", "searchable content".toByteArray()))
+        val second = Note(title = "Second"); repository.save(second)
+        val initial = backup.inspect().fingerprint
+        while (repository.indexNext()) Unit
+        assertEquals(initial, backup.inspect().fingerprint)
+        repository.access { v -> v.dao.put(dev.securenotes.storage.NoteRow.of(first.copy(tagIds = listOf(b.id, a.id)))) }
+        assertEquals(initial, backup.inspect().fingerprint)
+        repository.reorderVisible(listOf(first.id, second.id))
+        assertNotEquals(initial, backup.inspect().fingerprint)
+        val ordered = backup.inspect().fingerprint
+        repository.access { repository.setPassphrase(it, otherPhrase, true) }
+        assertNotEquals(ordered, backup.inspect().fingerprint)
+    }
+    @Test fun restoreCopiesLatestDeviceConfigurationAtPublicationAndPreservesActiveEvidence() = runBlocking {
+        repository.save(Note(title = "Restored"))
+        val file = backup.create({})!!.first; sources += file
+        backup.stage(source("device-config.ssnb", file.readBytes()), phrase.toCharArray()) {}
+        val config = dev.securenotes.backup.BackupConfiguration(mode = dev.securenotes.backup.BackupMode.PAIR,
+            folder = "content://synthetic/folder", slots = listOf("A", "B").map {
+                dev.securenotes.backup.BackupSlot("content://synthetic/$it", "$it.ssnb", 123, "a".repeat(64))
+            }, active = 0, phraseHash = dev.securenotes.backup.BackupService.phraseHash(otherPhrase), fingerprint = "b".repeat(64), savedAt = 123)
+        repository.access { dev.securenotes.backup.VaultBackupSettings.write(it, config) }
+        backup.commit()
+        val copied = repository.access { dev.securenotes.backup.VaultBackupSettings.read(it) }
+        assertEquals(config.slots, copied.slots); assertEquals(0, copied.active); assertTrue(copied.pending)
+        assertEquals(dev.securenotes.backup.BackupProblem.PHRASE_CHANGED, copied.error?.problem)
+        assertEquals(phrase, repository.passphrase())
+    }
+    @Test fun missingEstablishedRecoveryPhraseIsNeverRegenerated() = runBlocking {
+        repository.confirmPassphrase()
+        repository.access { it.dao.deleteSecret("passphrase") }
+        var generated = false
+        try { repository.ensurePassphrase { generated = true; otherPhrase }; fail("Replaced established phrase") } catch (_: IllegalStateException) { }
+        assertFalse(generated)
+        assertArrayEquals(root, repository.recoverRoot(phrase.toCharArray()))
+        repository.access { it.recoveryFile.delete(); it.dao.deleteSecret("passphrase-confirmed") }
+        try { repository.ensurePassphrase { generated = true; otherPhrase }; fail("Inferred first run from missing words") } catch (_: IllegalStateException) { }
+        assertFalse(generated)
+    }
+    @Test fun backupsOverTwentyMiBAreStreamedAndRestoreAttachmentIntegrity() = runBlocking {
+        val payload = ByteArray(21 * 1024 * 1024).also { java.util.Random(42).nextBytes(it) }
+        val note = repository.import(Note(title = "Large attachment"), source("large.bin", payload))
+        repository.confirmPassphrase()
+        backup.prepare({}).use { artifact ->
+            assertTrue(artifact.length > 20L * 1024 * 1024)
+            val uri = FileProvider.getUriForFile(context, "${context.packageName}.camera", File(File(context.cacheDir, "camera"), "large-backup.ssnb").also {
+                artifact.file.copyTo(it, overwrite = true); sources += it
+            })
+            backup.stage(uri, phrase.toCharArray()) {}; backup.commit()
+        }
+        val attachment = repository.attachments().values.single()
+        repository.access { v -> v.read(attachment.id).use { assertEquals(attachment.sha256, dev.securenotes.backup.ciphertextDigest(it)) } }
+        assertEquals(note, repository.notes.value.single())
+    }
     @After fun cleanup() = runBlocking {
         if (::backup.isInitialized) backup.discard()
         if (::repository.isInitialized) repository.close()

@@ -3,6 +3,7 @@ package dev.securenotes
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.lifecycle.ViewModelProvider
@@ -692,7 +693,6 @@ class UiFlowTest {
     @Test fun restoreRejectsInvalidHeaderBeforePassphraseAndRequiresDestructiveConfirmation() {
         unlock()
         runBlocking { app.repository.save(Note(title = "Backup note")) }
-        val phrase = runBlocking { app.repository.passphrase() }
         val encrypted = runBlocking { vm.backups.create({})!!.first }
         val source = File(File(app.cacheDir, "camera").apply { mkdirs() }, "restore-test.ssnb").apply { writeBytes(encrypted.readBytes()) }
         val bad = File(source.parentFile, "invalid-test.bin").apply { writeText("not a backup") }
@@ -705,10 +705,8 @@ class UiFlowTest {
         assertNull(vm.passwordMode)
         compose.onNodeWithText("OK").performClick()
         compose.runOnUiThread { vm.selectRestore(validUri) }
-        compose.waitUntil(10_000) { vm.passwordMode == "restore" }
-        compose.onNodeWithText("Continue").assertIsNotEnabled()
-        compose.onNodeWithText("Recovery passphrase").performTextInput(phrase)
-        compose.onNodeWithText("Continue").performClick()
+        // A confirmed device phrase is tried before asking for words.
+        assertNull(vm.passwordMode)
         compose.waitUntil(40_000) { vm.restoreCount != null }
         compose.onNodeWithText("Replace all notes?").assertIsDisplayed()
         assertEquals("Current note", app.repository.notes.value.single().title)
@@ -717,7 +715,181 @@ class UiFlowTest {
         assertNull(vm.backups.pending)
         source.delete(); bad.delete(); encrypted.delete()
     }
-    @Test fun choosingAutomaticBackupUsesCreateDocumentAndCancellationLeavesItOff() {
+    @Test fun migrationBannerOpensExistingSettingsAndKeepsLegacyFileName() {
+        unlock()
+        runBlocking {
+            app.repository.access { dev.securenotes.backup.VaultBackupSettings.write(it,
+                dev.securenotes.backup.BackupConfiguration(mode = dev.securenotes.backup.BackupMode.LEGACY,
+                    legacyUri = "content://synthetic/old", legacyName = "Historical.ssnb", savedAt = 123)) }
+            app.autoBackup.refresh()
+        }
+        compose.setContent { SecureNotesApp(vm, {}, {}, {}) }
+        compose.onNodeWithText("Review backup").performClick()
+        compose.onNodeWithText("Historical.ssnb").assertIsDisplayed()
+        compose.onNodeWithText("Choose backup folder").performScrollTo().assertIsEnabled()
+        assertEquals(dev.securenotes.backup.BackupMode.LEGACY, app.autoBackup.status.value!!.configuration.mode)
+    }
+    @Test fun changedPhraseDisablesSavingAndRequiresReviewBeforeNewPairPicker() {
+        unlock()
+        runBlocking {
+            app.repository.access { dev.securenotes.backup.VaultBackupSettings.write(it,
+                dev.securenotes.backup.BackupConfiguration(mode = dev.securenotes.backup.BackupMode.PAIR,
+                    folder = "content://synthetic/folder", slots = listOf("A", "B").map { label ->
+                        dev.securenotes.backup.BackupSlot("content://synthetic/$label", "$label.ssnb", 123, "a".repeat(64))
+                    }, phraseHash = "b".repeat(64), fingerprint = "c".repeat(64), pending = true,
+                    error = dev.securenotes.backup.BackupError(dev.securenotes.backup.BackupProblem.PHRASE_CHANGED, "restore"))) }
+            app.autoBackup.refresh()
+        }
+        var reviewRequested = false
+        compose.setContent { SecureNotesApp(vm, {}, {}, {}, reveal = { reviewRequested = true }) }
+        compose.onNodeWithText("Review backup").performClick()
+        compose.onNodeWithText("Back up now").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithText("Create new backup pair").performScrollTo().performClick()
+        assertTrue(reviewRequested)
+        compose.onNodeWithText("View recovery passphrase").performScrollTo().assertIsEnabled()
+        compose.onNodeWithText("Restore from backup").performScrollTo().assertIsEnabled()
+    }
+    private fun showLegacyBackupBanner() = runBlocking {
+        app.repository.access { dev.securenotes.backup.VaultBackupSettings.write(it,
+            dev.securenotes.backup.BackupConfiguration(mode = dev.securenotes.backup.BackupMode.LEGACY,
+                legacyUri = "content://synthetic/old", legacyName = "Historical.ssnb")) }
+        app.autoBackup.refresh()
+    }
+    @Test fun reviewBackupClosesReadingEditingImageAndEmptyDraftSessions() {
+        unlock(); showLegacyBackupBanner()
+        compose.setContent { SecureNotesApp(vm, {}, {}, {}) }
+        for (mode in listOf("search", "read", "edit", "image", "empty")) {
+            val note = Note(title = if (mode == "empty") "" else "Review $mode", document = plain(if (mode == "empty") "" else "target"))
+            if (mode != "empty") runBlocking { app.repository.save(note) }
+            compose.runOnUiThread {
+                if (mode == "search") { vm.screen = Screen.SEARCH; vm.search("Review") }
+                else if (mode == "empty") vm.create() else vm.open(note)
+                if (mode == "edit") { vm.enterEditing(1); vm.openFind(); vm.findQuery("target"); vm.change(vm.note!!.copy(title = "Saved before settings")) }
+                if (mode == "image") { vm.imageId = "synthetic-image"; vm.screen = Screen.IMAGE }
+            }
+            val id = vm.note?.id ?: note.id
+            compose.onNodeWithText("Review backup").performClick()
+            compose.waitUntil(10_000) { vm.screen == Screen.SETTINGS && !vm.reviewingBackup }
+            compose.runOnIdle {
+                assertNull(vm.note); assertNull(vm.imageId); assertFalse(vm.editing); assertFalse(vm.newDraft)
+                assertFalse(vm.findOpen); assertNull(vm.findReturn); assertFalse(vm.focusTitle); assertNull(vm.bodyFocus)
+                assertFalse(vm.history.canUndo)
+                assertEquals("", vm.query); assertTrue(vm.results.isEmpty())
+            }
+            if (mode == "empty") assertTrue(app.repository.notes.value.none { it.id == id })
+            if (mode == "edit") assertEquals("Saved before settings", app.repository.notes.value.first { it.id == id }.title)
+            compose.onNodeWithContentDescription("Back").performClick()
+            compose.runOnIdle { assertEquals(Screen.LIST, vm.screen); assertNull(vm.note) }
+        }
+    }
+    @Test fun reviewBackupWaitsForFlushAndRejectsRepeatedNavigationAndEditing() {
+        unlock(); showLegacyBackupBanner()
+        val note = Note(title = "Before")
+        runBlocking { app.repository.save(note) }
+        compose.setContent { SecureNotesApp(vm, {}, {}, {}) }
+        compose.runOnUiThread { vm.open(note); vm.enterEditing(); vm.change(note.copy(title = "Accepted")) }
+        runBlocking { app.repository.mutex.lock() }
+        try {
+            compose.runOnUiThread { vm.reviewBackup(); vm.reviewBackup(); vm.change(vm.note!!.copy(title = "Rejected")); vm.back() }
+            compose.runOnIdle { assertTrue(vm.reviewingBackup); assertEquals(Screen.NOTE, vm.screen); assertEquals("Accepted", vm.note!!.title) }
+        } finally { app.repository.mutex.unlock() }
+        compose.waitUntil(10_000) { vm.screen == Screen.SETTINGS && !vm.reviewingBackup }
+        assertEquals("Accepted", app.repository.notes.value.single().title)
+    }
+    @Test fun failedReviewBackupSaveLeavesTheNoteAvailableForCorrection() {
+        unlock(); showLegacyBackupBanner()
+        val note = Note(title = "Before")
+        runBlocking { app.repository.save(note); app.repository.access { it.database.openHelper.writableDatabase.execSQL("PRAGMA query_only=ON") } }
+        compose.setContent { SecureNotesApp(vm, {}, {}, {}) }
+        try {
+            compose.runOnUiThread { vm.open(note); vm.enterEditing(); vm.change(note.copy(title = "Pending")); vm.reviewBackup() }
+            compose.waitUntil(10_000) { !vm.reviewingBackup && vm.error != null }
+            compose.runOnUiThread { assertEquals(Screen.NOTE, vm.screen); assertTrue(vm.editing); vm.error = null; vm.change(vm.note!!.copy(title = "Corrected")) }
+            assertEquals("Corrected", vm.note!!.title)
+        } finally { runBlocking { app.repository.access { it.database.openHelper.writableDatabase.execSQL("PRAGMA query_only=OFF") }; vm.flush() } }
+        compose.runOnUiThread { vm.reviewBackup() }
+        compose.waitUntil(10_000) { vm.screen == Screen.SETTINGS }
+    }
+    @Test fun backupBannerConsumesStatusInsetOnlyWhileVisible() {
+        unlock()
+        var statusTop = 0
+        compose.setContent {
+            statusTop = androidx.compose.foundation.layout.WindowInsets.statusBars.getTop(androidx.compose.ui.platform.LocalDensity.current)
+            SecureNotesApp(vm, {}, {}, {})
+        }
+        fun toolbarHeight() = compose.onNodeWithContentDescription("Notes toolbar").fetchSemanticsNode().boundsInRoot.height
+        val ordinary = toolbarHeight()
+        showLegacyBackupBanner(); compose.onNodeWithText("Review backup").assertIsDisplayed()
+        assertEquals(ordinary - statusTop, toolbarHeight(), 1f)
+        runBlocking { app.autoBackup.turnOff() }
+        compose.onNodeWithText("Review backup").assertDoesNotExist()
+        assertEquals(ordinary, toolbarHeight(), 1f)
+    }
+    @Test fun providerWarningKeepsReservationAcrossReselectionAndCancellation() {
+        unlock()
+        compose.setContent { SecureNotesApp(vm, {}, {}, {}) }
+        compose.runOnUiThread {
+            vm.screen = Screen.SETTINGS
+            vm.launchBackupPicker { }
+            vm.chooseBackup(android.net.Uri.parse("content://other-provider/tree/selected"))
+        }
+        compose.onNodeWithText("Use anyway").assertIsDisplayed()
+        assertTrue(app.backupScheduler.state.value.selecting); assertEquals(0, app.keptAlive.value)
+        compose.runOnUiThread {
+            vm.launchBackupPicker { } // Same retained view model and reservation after a picker re-registration.
+            assertTrue(app.backupScheduler.state.value.selecting)
+            vm.chooseBackup(null)
+        }
+        assertFalse(app.backupScheduler.state.value.mutationsBlocked)
+        compose.runOnUiThread { vm.launchBackupPicker { throw IllegalStateException() } }
+        assertFalse(app.backupScheduler.state.value.mutationsBlocked)
+        assertEquals(app.getString(R.string.backup_picker_failed), vm.error)
+    }
+    @Test fun settingsLabelsUnconfirmedNamesAndKeepsSetupFailureSeparate() {
+        unlock()
+        runBlocking {
+            app.repository.access { dev.securenotes.backup.VaultBackupSettings.write(it,
+                dev.securenotes.backup.BackupConfiguration(mode = dev.securenotes.backup.BackupMode.PAIR,
+                    folder = "content://synthetic/folder", slots = listOf("A", "B").map { label ->
+                        dev.securenotes.backup.BackupSlot("content://synthetic/$label", "$label.ssnb", 123, "a".repeat(64), nameConfirmed = label == "B")
+                    }, phraseHash = "b".repeat(64), fingerprint = "c".repeat(64),
+                    error = dev.securenotes.backup.BackupError(dev.securenotes.backup.BackupProblem.ACTIVE_DAMAGED, "verify-active"))) }
+            app.autoBackup.refresh()
+        }
+        compose.setContent { SecureNotesApp(vm, {}, {}, {}) }
+        compose.onNodeWithText("Review backup").performClick()
+        compose.onNodeWithText(app.getString(R.string.backup_unconfirmed_name, "A.ssnb")).performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("B.ssnb").assertIsDisplayed()
+        compose.runOnUiThread { app.autoBackup.setupFlushFailed() }
+        compose.onNodeWithText(app.getString(R.string.backup_damaged)).performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText(app.getString(R.string.backup_setup_error, app.getString(R.string.backup_setup_io))).performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Create new backup pair").performScrollTo().assertIsEnabled()
+        compose.onNodeWithText("Restore from backup").performScrollTo().assertIsEnabled()
+    }
+    @Test fun activeAccessFailureOffersAnEnabledPermissionCheckBeforeBackupRetry() {
+        unlock()
+        runBlocking {
+            app.repository.access { dev.securenotes.backup.VaultBackupSettings.write(it,
+                dev.securenotes.backup.BackupConfiguration(mode = dev.securenotes.backup.BackupMode.PAIR,
+                    folder = "content://synthetic/folder", slots = listOf("A", "B").map { label ->
+                        dev.securenotes.backup.BackupSlot("content://synthetic/$label", "$label.ssnb", 123, "a".repeat(64))
+                    }, phraseHash = "b".repeat(64), fingerprint = "c".repeat(64),
+                    error = dev.securenotes.backup.BackupError(dev.securenotes.backup.BackupProblem.ACCESS, "verify-active"))) }
+            app.autoBackup.refresh()
+        }
+        compose.setContent { SecureNotesApp(vm, {}, {}, {}) }
+        compose.onNodeWithText("Review backup").performClick()
+        compose.onNodeWithText(app.getString(R.string.backup_active_access)).performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Back up now").assertDoesNotExist()
+        compose.onNodeWithText(app.getString(R.string.backup_check_access)).performScrollTo().assertIsEnabled().performClick()
+        compose.waitUntil(10_000) { !app.backupScheduler.state.value.mutationsBlocked }
+        compose.onNodeWithText(app.getString(R.string.backup_check_access)).assertIsEnabled()
+        assertEquals(0, app.keptAlive.value)
+        assertEquals(dev.securenotes.backup.BackupProblem.ACCESS, app.autoBackup.status.value!!.error!!.problem)
+        compose.onNodeWithText("Create new backup pair").performScrollTo().assertIsEnabled()
+        compose.onNodeWithText("Restore from backup").performScrollTo().assertIsEnabled()
+    }
+    @Test fun choosingAutomaticBackupUsesOpenDocumentTreeAndCancellationLeavesItOff() {
         unlock()
         runBlocking { app.repository.save(Note(title = "To back up")) }
         var launched: android.content.Intent? = null
@@ -732,11 +904,11 @@ class UiFlowTest {
             androidx.compose.runtime.CompositionLocalProvider(androidx.activity.compose.LocalActivityResultRegistryOwner provides owner) { SecureNotesApp(vm, {}, {}, {}) }
         }
         compose.onNodeWithContentDescription("Settings").performClick()
-        compose.onNodeWithText("Choose backup file").performClick()
+        compose.onNodeWithText("Choose backup folder").performClick()
         compose.waitUntil(10_000) { launched != null }
-        assertEquals(android.content.Intent.ACTION_CREATE_DOCUMENT, launched!!.action)
-        assertEquals("application/octet-stream", launched!!.type)
-        compose.onNodeWithText("Choose backup file").assertIsDisplayed()
+        assertEquals(android.content.Intent.ACTION_OPEN_DOCUMENT_TREE, launched!!.action)
+        assertNull(launched!!.type)
+        compose.onNodeWithText("Choose backup folder").assertIsDisplayed()
         assertNull(app.autoBackup.status.value?.location)
         assertTrue(File(app.cacheDir, "backups").listFiles().orEmpty().isEmpty())
     }

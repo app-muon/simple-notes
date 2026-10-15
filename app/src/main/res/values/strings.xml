@@ -1,3 +1,31 @@
 <resources>
     <string name="app_name">Notes</string>
+    <string name="backup_guidance">Choose a dedicated phone-storage subfolder, for example NotesBackups in Downloads. Notes alternates between two encrypted files and verifies each save locally. Sync both files in upload-only mode. Local verification does not confirm an external upload.</string>
+    <string name="backup_provider_title">Use this backup provider?</string>
+    <string name="backup_provider_warning">This provider may delay reads, reject repeated writes, or lose access after reboot. A dedicated phone-storage subfolder with both files synced in upload-only mode is recommended. A save succeeds only after Notes can read back and verify it.</string>
+    <string name="backup_migration">Your single-file backup is preserved and is no longer updated. Choose a folder to create a verified A/B pair.</string>
+    <string name="backup_restart">Backup settings could not be confirmed. Close and restart Notes before changing backups. Existing files are retained.</string>
+    <string name="backup_busy">A backup operation is already running or the session is unavailable. Wait and try again.</string>
+    <string name="backup_io">The latest backup failed. Check storage and the provider, then tap Back up now to retry. The active file was not overwritten by this attempt.</string>
+    <string name="backup_active_unverified">The active backup file could not be read, so its condition could not be verified. No backup file was overwritten. Check access and retry with Back up now, or create a new pair if the file is missing.</string>
+    <string name="backup_active_access">The active backup file could not be accessed, so its condition could not be verified. No backup file was overwritten. Check backup access in Settings and retry when access is available, or create a new pair if the file is missing or remains inaccessible.</string>
+    <string name="backup_check_access">Check backup access</string>
+    <string name="backup_setup_io">The new backup pair could not be created and verified. Check storage and the provider, then choose a folder again. Existing backup files were not overwritten.</string>
+    <string name="backup_setup_access">The selected folder could not be accessed. Choose the folder again and allow access, or choose another folder.</string>
+    <string name="backup_setup_error">Setup: %1$s</string>
+    <string name="backup_select_again">The backup folder selection is no longer valid. Unlock Notes and select the folder again.</string>
+    <string name="backup_picker_failed">The folder picker could not be opened. Try choosing a backup folder again.</string>
+    <string name="backup_navigation_save_failed">Changes could not be saved. Free some storage and correct or retry the note before reviewing backups.</string>
+    <string name="backup_unconfirmed_name">%1$s (provider filename unavailable; requested name)</string>
+    <string name="backup_review">Review backup</string>
+    <string name="backup_use_provider">Use anyway</string>
+    <string name="backup_choose_again">Choose again</string>
+    <string name="backup_access">Backup access is unavailable. Restore the folder permission or choose the folder again to create a new pair.</string>
+    <string name="backup_manifest">Backup metadata exceeds the 16 MiB limit. Reduce note text or metadata before retrying. Attachment payloads have no total backup size limit.</string>
+    <string name="backup_phrase_missing">The confirmed recovery phrase is unavailable. Backups are paused. Review your recovery phrase or restore using your saved words; Notes will not generate replacement words.</string>
+    <string name="backup_phrase_changed">The restored recovery phrase differs from this pair. View and review the recovery phrase, then create a new backup pair. The old files remain encrypted with their original phrase.</string>
+    <string name="backup_damaged">The last verified backup has changed or is damaged. No file was overwritten. Create a new pair and keep the old files for recovery.</string>
+    <string name="backup_configuration">Backup configuration is invalid. Restart Notes before changing backups. Existing files are retained.</string>
+    <string name="backup_pending">A backup still needs to finish. The previous verified slot remains active until a new save is verified and recorded.</string>
+    <string name="backup_working">Preparing and verifying encrypted backup…</string>
 </resources>

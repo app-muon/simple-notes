@@ -53,7 +53,12 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
             recoverEdits(opened)
             notes.value = opened.orderedNotes()
             storedTags.value = opened.dao.tags().map { it.decode() }
-            if (!active.exists()) atomicWrite(active, id.toByteArray())
+            if (!active.exists()) {
+                // Only a vault explicitly awaiting its first phrase may generate words. This marker
+                // survives a failed first-run write; established vaults never infer setup from absence.
+                opened.dao.putSecret(SecretRow("passphrase-new-vault", byteArrayOf(1)))
+                atomicWrite(active, id.toByteArray())
+            }
             cleanupGenerations(id)
             garbageCollect(opened)
             vault = opened
@@ -130,13 +135,22 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
     suspend fun setPassphrase(v: Vault, passphrase: String, confirmed: Boolean) {
         val chars = passphrase.toCharArray()
         try { atomicWrite(v.recoveryFile, Passphrase.wrap(checkNotNull(root), chars, Passphrase.recoveryAad(v.id))) } finally { chars.fill('\u0000') }
-        v.dao.putSecret(SecretRow("passphrase", passphrase.toByteArray(Charsets.UTF_8)))
-        if (confirmed) v.dao.putSecret(SecretRow("passphrase-confirmed", byteArrayOf(1))) else v.dao.deleteSecret("passphrase-confirmed")
-        if (v === vault) passphraseConfirmed.value = confirmed
+        v.database.withTransaction {
+            v.dao.putSecret(SecretRow("passphrase", passphrase.toByteArray(Charsets.UTF_8)))
+            if (confirmed) v.dao.putSecret(SecretRow("passphrase-confirmed", byteArrayOf(1))) else v.dao.deleteSecret("passphrase-confirmed")
+            v.dao.deleteSecret("passphrase-new-vault")
+        }
+        if (v === vault) { passphraseConfirmed.value = confirmed; changes.value++ }
     }
     /** Creates the recovery passphrase on first unlock; returns whether the user has confirmed saving it. */
     suspend fun ensurePassphrase(generate: () -> String): Boolean = access { v ->
-        if (v.passphrase() == null || !v.recoveryFile.exists()) setPassphrase(v, v.passphrase() ?: generate(), false)
+        val phrase = v.passphrase()
+        if (phrase == null) {
+            // Established recovery evidence must never be replaced by newly generated words.
+            check(v.dao.secret("passphrase-new-vault") != null && !v.passphraseConfirmed() && v.dao.notes().isEmpty() && v.dao.tags().isEmpty() &&
+                v.dao.secret("backup-uri") == null && v.dao.secret(dev.securenotes.backup.VaultBackupSettings.KEY) == null) { "Recovery passphrase missing" }
+            setPassphrase(v, generate(), false)
+        } else if (!v.recoveryFile.exists()) setPassphrase(v, phrase, v.passphraseConfirmed())
         v.passphraseConfirmed().also { passphraseConfirmed.value = it }
     }
     suspend fun passphrase(): String = access { checkNotNull(it.passphrase()) }
@@ -239,6 +253,7 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
         val validTags = v.dao.tags().map { it.id }.toSet()
         val current = note.copy(tagIds = note.tagIds.filter(validTags::contains))
         v.database.withTransaction { saveIn(v, current, validTags); v.dao.putImport(job) }
+        changes.value++ // Even an interrupted import may have committed its note before attachment streaming.
         try {
             completeImport(v, job)
         } catch (e: Exception) {

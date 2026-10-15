@@ -20,8 +20,8 @@ The fault is inside the Dropbox app's file provider, which the backing-up app ca
 
 ## The setup that works
 
-1. **The user chooses a backup file in phone storage,** for example `Downloads/NotesBackups/Notes.ssnb`, and the app keeps it overwritten with the latest encrypted backup.
-2. **A sync app uploads that folder to Dropbox,** for example Autosync for Dropbox in **Upload only** mode, which uploads new and changed files and never passes local deletions on. Check it on the phone, including after the phone has been idle.
+1. **Choose a dedicated phone-storage subfolder**, for example `Downloads/NotesBackups`. Notes creates two timestamped A/B files, verifies both, and later replaces only the inactive slot after verifying the active copy.
+2. **A sync app uploads both files in that folder to Dropbox,** for example Autosync for Dropbox in **Upload only** mode, which uploads new and changed files and never passes local deletions on. Check it on the phone, including after the phone has been idle.
 
 The app keeps its no-network policy. It reports when it saved locally; the sync app reports uploads.
 
@@ -33,17 +33,21 @@ The app keeps its no-network policy. It reports when it saved locally; the sync 
 
 ## Implementation notes
 
-### Choosing and writing the file
+### Choosing and writing the pair
 
-- **Pick the file** with `CreateDocument("application/octet-stream")`, call `takePersistableUriPermission(uri, READ or WRITE)`, and store the URI. Before each save, check that `persistedUriPermissions` still holds a write grant; if not, ask the user to choose the file again.
-- **Open it with a truncating mode,** `"rwt"` then `"wt"`. Fall back to plain `"w"` only when opening fails, never after a failed write.
-- **Check the size only after plain `"w"`,** because that mode may leave old bytes at the end of the file. Don't read the file back after a truncating mode: a cloud provider reports the old size until its upload finishes. That turns every success into a false failure, and the app then retries at every trigger.
-- **Build the encrypted file in the app's cache first,** then copy it across in one go inside `withContext(NonCancellable + Dispatchers.IO)`. It's already ciphertext, so finishing the copy after the app locks is safe.
+- Pick a subfolder with OpenDocumentTree. Retain and verify read/write access; store the folder, actual names, and URIs in one encrypted configuration record.
+- Create two new timestamped documents; never adopt a file by name. Verify both before committing setup. Preserve historical files and retain all grants after an uncertain settings commit.
+- Record each newly created URI before querying its name. If the provider supplies no usable name, show the requested label as unconfirmed; verification still uses the URI. A security or cancellation error during the name query triggers cleanup.
+- If the active file cannot be read, say its condition could not be verified and no backup file was overwritten. Retry after checking access, or create a new pair if missing. Do not describe an unreadable file as a retained verified copy or as proven corruption.
+- Keep oversized-snapshot revision suppression in memory. Preserve it across lock/unlock, but allow a fresh check after process restart. Cache grant eligibility in memory and refresh it on IO; recheck actual grants within storage attempts.
+- Before writing, verify the active file's exact length and digest. Persist pending work, write only the inactive slot, explicitly flush/truncate/sync/close, then read it back with bounded buffers and verify exact EOF and SHA-256.
+- Open with rwt, then wt, then w only when opening fails. Propagate security failures without fallback. Unlike the old single-file approach, read-back is mandatory for every mode. A stale provider result is a failed save, not grounds to claim verification.
+- Prepare ciphertext in cache and finish an inactive copy non-cancellably. Publish active-slot metadata only after verification and acknowledged persistence. If locked, leave pending work for unlock. Uncertain settings writes require process restart.
 
 ### Format
 
 - **Encrypt under a recovery passphrase,** so the backup restores on a new phone. Use authenticated encryption with a fresh random salt for every backup. An incomplete file then fails authentication, so a sync that catches the file mid-write is rejected on restore and replaced by the next sync.
-- **Fingerprint the content and skip unchanged saves.** Record the fingerprint and the "last saved" time only after the copy succeeds.
+- **Fingerprint the content and skip unchanged saves.** Include the normalized phrase hash and record the fingerprint and verified time only after read-back and settings commit. Pending work or a retryable error prevents unchanged-content skipping.
 
 ### When to save
 
@@ -61,6 +65,12 @@ Android freezes an app within seconds of the user leaving it, so a save started 
 ### Errors the user can relay
 
 Show the "last saved" time and the latest error in Settings. For unexpected failures, add the failed step, the exception types, and the errno name for an `ErrnoException` (from `OsConstants.errnoName`), for example `(Failed at write rwt: IOException / ErrnoException EBADF)`. Never show exception messages, which can contain file names or URIs. This detail is what diagnosed the Dropbox failure without device logs.
+
+## Recovery and migration
+
+Existing single-file backups become migration-required history and are never overwritten again. Create a fresh pair through folder selection. Restore tries the confirmed device phrase first, then asks for words if envelope authentication fails. The successful phrase becomes the recovery phrase. If it differs from the configured pair, review it after authentication and create a new pair; preserve both old files under their original words. Never silently replace an established missing phrase.
+
+The .ssnb streaming format, fresh salts/keys, attachment handling, and 16 MiB manifest limit are unchanged. There is no total backup size limit, plaintext configuration/export path, cached derived key, or invented creation timestamp. See [the format](docs/backup-format.md) and [security decisions](docs/security.md).
 
 ## Testing
 

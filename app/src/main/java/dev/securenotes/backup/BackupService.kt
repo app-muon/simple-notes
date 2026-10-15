@@ -2,6 +2,8 @@ package dev.securenotes.backup
 
 import android.content.Context
 import android.net.Uri
+import androidx.annotation.VisibleForTesting
+import androidx.room.withTransaction
 import dev.securenotes.document.*
 import dev.securenotes.security.Crypto
 import dev.securenotes.security.Passphrase
@@ -23,7 +25,12 @@ import java.util.zip.ZipOutputStream
     fun orderedIds(): List<String> = if (version == 1) sortedNotes(notes, checkNotNull(sort)).map(Note::id) else checkNotNull(order)
 }
 
-class BackupService(private val context: Context, private val repository: NotesRepository, private val checkAccess: () -> Unit) {
+class BackupService(private val context: Context, private val repository: NotesRepository, private val checkAccess: () -> Unit) : BackupSource {
+    override val revision: Long get() = repository.changes.value
+    var coordinator: AutoBackup? = null
+    data class Counts(val notes: Int, val attachments: Int, val tags: Int)
+    var pendingCounts: Counts? = null
+        private set
     suspend fun checkHeader(uri: Uri) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
         checkAccess()
         context.contentResolver.openInputStream(uri)!!.use(BackupCodec::validateHeader)
@@ -31,25 +38,47 @@ class BackupService(private val context: Context, private val repository: NotesR
     private val cache = File(context.cacheDir, "backups").apply { mkdirs() }
     @Volatile var pending: Vault? = null
         private set
-    /**
-     * Encrypts a backup under the vault's recovery passphrase. Returns the file and a content fingerprint,
-     * or null when the content still matches [unchangedSince].
-     */
-    suspend fun create(progress: (String) -> Unit, unchangedSince: String? = null): Pair<File, String>? = repository.access { v ->
+    private data class Snapshot(val manifest: BackupManifest, val bytes: ByteArray, val content: BackupInspection, val phrase: String)
+    private suspend fun snapshot(v: Vault, requireConfirmed: Boolean): Snapshot {
+        val capturedRevision = revision
+        val phrase = v.passphrase()?.let(Passphrase::normalize)?.takeIf { it.isNotBlank() } ?: throw BackupFailure(BackupProblem.PHRASE_MISSING)
+        if (requireConfirmed && !v.passphraseConfirmed()) throw BackupFailure(BackupProblem.PHRASE_MISSING)
+        val manifest = v.database.withTransaction {
+            val notes = v.orderedNotes()
+            val ids = notes.flatMap { it.document.attachments }.toSet()
+            BackupManifest(notes = notes.sortedBy { it.id }.map { it.copy(tagIds = it.tagIds.sorted()) },
+                attachments = v.dao.attachments().filter { it.id in ids }.sortedBy { it.id }.map { it.copy(indexed = false, nextPage = 0) },
+                order = notes.map(Note::id), tags = v.dao.tags().map { it.decode() }.sortedBy { it.id })
+        }
+        val bytes = documentJson.encodeToString(manifest).toByteArray(Charsets.UTF_8)
+        checkManifestSize(bytes.size, capturedRevision)
+        val hash = phraseHash(phrase)
+        val digest = java.security.MessageDigest.getInstance("SHA-256").apply { update(bytes); update(hash.toByteArray(Charsets.UTF_8)) }.digest().hex()
+        return Snapshot(manifest, bytes, BackupInspection(digest, hash, capturedRevision, manifest.notes.isEmpty() && manifest.tags.isEmpty()), phrase)
+    }
+    override suspend fun inspect(): BackupInspection = repository.access { snapshot(it, true).content }
+    override suspend fun prepare(progress: (String) -> Unit): PreparedBackup {
+        var artifact: PreparedBackup? = null
+        try { return repository.access { encrypt(it, snapshot(it, true), progress).also { result -> artifact = result } } }
+        catch (e: Exception) { artifact?.close(); throw e }
+    }
+    /** Test fixtures deliberately bypass phrase confirmation; production [prepare] always requires it. */
+    @VisibleForTesting
+    internal suspend fun create(progress: (String) -> Unit, unchangedSince: String? = null): Pair<File, String>? = repository.access { v ->
+        val snapshot = snapshot(v, false)
+        if (snapshot.content.fingerprint == unchangedSince) null else encrypt(v, snapshot, progress).let { it.file to it.content.fingerprint }
+    }
+    // The repository mutex protects blobs from deletion; the metadata transaction has already ended.
+    private suspend fun encrypt(v: Vault, snapshot: Snapshot, progress: (String) -> Unit): PreparedBackup {
         val operation = currentCoroutineContext()
-        val notes = v.orderedNotes()
-        val ids = notes.flatMap { it.document.attachments }.toSet()
-        val attachments = v.dao.attachments().filter { it.id in ids }
-        val manifest = BackupManifest(notes = notes, attachments = attachments.map { it.copy(indexed = false, nextPage = 0) }, order = notes.map(Note::id), tags = v.dao.tags().map { it.decode() })
-        val manifestBytes = documentJson.encodeToString(manifest).toByteArray()
-        val fingerprint = Crypto.hash(manifestBytes).hex()
-        if (fingerprint == unchangedSince) return@access null
-        val password = checkNotNull(v.passphrase()) { "Recovery passphrase missing" }.toCharArray()
+        val password = snapshot.phrase.toCharArray()
         val output = File(cache, "${newId()}.ssnb")
-        try {
+        return try {
+            checkAccess(); operation.ensureActive()
             output.outputStream().buffered().use { encrypted -> BackupCodec.encrypt(encrypted, password) { clear ->
                 val zip = ZipOutputStream(clear)
-                zip.putNextEntry(ZipEntry("manifest.json")); zip.write(manifestBytes); zip.closeEntry()
+                zip.putNextEntry(ZipEntry("manifest.json")); zip.write(snapshot.bytes); zip.closeEntry()
+                val attachments = snapshot.manifest.attachments
                 attachments.forEachIndexed { index, a ->
                     checkAccess(); operation.ensureActive(); progress("Encrypting attachment ${index + 1} of ${attachments.size}")
                     zip.putNextEntry(ZipEntry("attachments/${a.id}"))
@@ -57,17 +86,18 @@ class BackupService(private val context: Context, private val repository: NotesR
                 }
                 zip.finish(); zip.flush()
             } }
-            output to fingerprint
+            checkAccess(); operation.ensureActive()
+            PreparedBackup(output, snapshot.content, output.length(), output.inputStream().use(::ciphertextDigest))
         } catch (e: Exception) { output.delete(); throw e }
         finally { password.fill('\u0000') }
     }
     /** Restores a backup encrypted under [passphrase]; that passphrase becomes the restored vault's recovery passphrase. */
-    suspend fun stage(uri: Uri, passphrase: CharArray, progress: (String) -> Unit): Int = repository.access { current ->
+    suspend fun stage(uri: Uri, passphrase: CharArray, progress: (String) -> Unit): Int = repository.access {
         val canonical = Passphrase.normalize(String(passphrase))
         val password = canonical.toCharArray()
-        try { return@access stageWith(current, uri, canonical, password, progress) } finally { password.fill('\u0000') }
+        try { return@access stageWith(uri, canonical, password, progress) } finally { password.fill('\u0000') }
     }
-    private suspend fun stageWith(current: Vault, uri: Uri, canonical: String, password: CharArray, progress: (String) -> Unit): Int {
+    private suspend fun stageWith(uri: Uri, canonical: String, password: CharArray, progress: (String) -> Unit): Int {
         val operation = currentCoroutineContext()
         discard()
         val staged = repository.staging()
@@ -77,7 +107,7 @@ class BackupService(private val context: Context, private val repository: NotesR
                 BackupCodec.decrypt(encrypted, password) { clear ->
                     val zip = ZipInputStream(clear)
                     require(zip.nextEntry?.name == "manifest.json") { "Missing manifest" }
-                    val manifestBytes = readBounded(zip, 16 * 1024 * 1024)
+                    val manifestBytes = readBounded(zip, MANIFEST_LIMIT)
                     val data = documentJson.decodeFromString<BackupManifest>(manifestBytes.toString(Charsets.UTF_8))
                     validate(data); manifest = data
                     val requiredBytes = data.attachments.fold(0L) { total, attachment -> Math.addExact(total, attachment.size) }
@@ -104,30 +134,40 @@ class BackupService(private val context: Context, private val repository: NotesR
             data.attachments.forEach { staged.dao.putAttachment(it.copy(indexed = false, nextPage = 0)) }
             data.notes.forEach { repository.saveIn(staged, it, validTags) }
             staged.setNoteOrder(data.orderedIds())
-            // The user just typed this passphrase, so it counts as confirmed.
+            // Either confirmed device words or explicitly entered words decrypted this backup.
             repository.setPassphrase(staged, canonical, confirmed = true)
-            // The automatic backup destination belongs to this device, not to the restored content.
-            AutoBackup.DEVICE_SECRETS.forEach { name -> current.dao.secret(name)?.let { staged.dao.putSecret(SecretRow(name, it)) } }
             checkAccess(); operation.ensureActive(); pending = staged
+            pendingCounts = Counts(data.notes.size, data.attachments.size, data.tags.size)
             data.notes.size
         } catch (e: Exception) { staged.close(); staged.directory.deleteRecursively(); throw e }
     }
-    suspend fun commit() = repository.access {
-        val staged = checkNotNull(pending)
-        pending = null // Claim ownership before lock/cancel UI can discard the pending stage.
-        try { repository.activate(staged) }
-        catch (e: Exception) {
-            if (repository.vault !== staged) { staged.close(); staged.directory.deleteRecursively() }
-            throw e
+    suspend fun commit() {
+        val hash = repository.access { phraseHash(checkNotNull(checkNotNull(pending).passphrase())) }
+        suspend fun publish(configuration: BackupConfiguration?, beginWrite: () -> Unit = {}) = repository.access { current ->
+            val staged = checkNotNull(pending)
+            pending = null; pendingCounts = null
+            try {
+                beginWrite()
+                VaultBackupSettings.write(staged, configuration ?: VaultBackupSettings.read(current).afterRestore(hash))
+                repository.activate(staged)
+            } catch (e: Exception) {
+                if (repository.vault !== staged) { staged.close(); staged.directory.deleteRecursively() }
+                throw e
+            }
         }
+        val coordinator = coordinator
+        if (coordinator != null) coordinator.publishRestore(hash) { config, begin -> publish(config, begin) } else publish(null)
     }
-    fun discard() { pending?.let { it.close(); it.directory.deleteRecursively() }; pending = null }
+    fun discard() { pending?.let { it.close(); it.directory.deleteRecursively() }; pending = null; pendingCounts = null }
     fun copyChecked(input: InputStream, output: OutputStream, checkpoint: () -> Unit = {}) {
         val buffer = ByteArray(64 * 1024)
         try { while (true) { checkAccess(); checkpoint(); val count = input.read(buffer); if (count < 0) break; output.write(buffer, 0, count) } }
         finally { buffer.fill(0) }
     }
     companion object {
+        const val MANIFEST_LIMIT = 16 * 1024 * 1024
+        fun checkManifestSize(size: Int, revision: Long) { if (size > MANIFEST_LIMIT) throw ManifestTooLarge(revision) }
+        fun phraseHash(phrase: String) = Crypto.hash(Passphrase.normalize(phrase).toByteArray(Charsets.UTF_8)).hex()
         fun readBounded(input: InputStream, limit: Int): ByteArray {
             val out = ByteArrayOutputStream()
             val buffer = ByteArray(8192)

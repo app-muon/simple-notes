@@ -6,6 +6,9 @@ import androidx.compose.runtime.*
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.securenotes.NotesApplication
+import dev.securenotes.R
+import dev.securenotes.backup.BackupAdmission
+import dev.securenotes.backup.BackupSetupToken
 import dev.securenotes.document.*
 import dev.securenotes.search.*
 import dev.securenotes.security.Passphrase
@@ -34,8 +37,13 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     var revealedWords by mutableStateOf<List<String>?>(null)
     /** A "Show recovery passphrase" prompt is running. Kept here, not in the activity, so it survives rotation. */
     var revealing = false
-    /** A chosen destination that already holds a backup (perhaps the only copy from another phone): overwriting it needs confirmation. */
-    var replaceBackup by mutableStateOf<Uri?>(null)
+    /** Non-local providers need an explicit acknowledgement after the folder picker. */
+    var backupProviderWarning by mutableStateOf<Uri?>(null)
+    private var backupSetupToken: BackupSetupToken? = null
+    // Retained even across lock until that launch's callback arrives; it must not adopt a newer token.
+    private var pendingBackupPicker: BackupSetupToken? = null
+    var reviewingBackup by mutableStateOf(false)
+        private set
     var screen by mutableStateOf(Screen.LIST)
     var note by mutableStateOf<Note?>(null)
     var editing by mutableStateOf(false)
@@ -106,7 +114,8 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
                 note = null; attachments = emptyMap(); results = emptyList(); query = ""; hit = null
                 clearFind(); filter = NoteFilter(); listAnchor = null; listOffset = 0
                 history.clear(); historyRevision++; screen = Screen.LIST; editing = false
-                busy = null; passwordMode = null; restoreCount = null; setupWords = null; revealedWords = null; replaceBackup = null
+                busy = null; passwordMode = null; restoreCount = null; setupWords = null; revealedWords = null; backupProviderWarning = null; restoreUri = null
+                backupSetupToken = null; reviewingBackup = false; newDraft = false; imageId = null; focusTitle = false; bodyFocus = null
             } else { keyUnavailable = false; reconcileTags(); reloadAttachments() }
         } }
         viewModelScope.launch { repository.passphraseConfirmed.collect { confirmed ->
@@ -115,6 +124,7 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
         } }
     }
     fun task(message: String?, failure: String, action: suspend () -> Unit) {
+        if (reviewingBackup) return
         val job = app.scope.launch { operationMutex.withLock {
             if (!app.unlocked.value) return@withLock
             activeOperation = currentCoroutineContext()[Job]
@@ -130,12 +140,14 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     suspend fun reloadAttachments() { attachments = repository.attachments() }
     fun create() = createDraft(inheritTag = true)
     private fun createDraft(inheritTag: Boolean) {
+        if (reviewingBackup) return
         clearFind()
         rememberEditorSelection(HitKind.TITLE, 0)
         note = Note(tagIds = if (inheritTag) listOfNotNull(filter.tagId) else emptyList()); newDraft = true; editing = true; focusTitle = true; bodyFocus = null
         history.clear(); historyRevision++; hit = null; screen = Screen.NOTE
     }
     fun open(value: Note, match: SearchHit? = null) {
+        if (reviewingBackup) return
         clearFind()
         rememberEditorSelection(HitKind.TITLE, 0)
         note = value; newDraft = false; editing = false; focusTitle = false; bodyFocus = null
@@ -143,6 +155,7 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     }
     /** Typing changes share one undo step until the user pauses; other changes are separate steps. */
     fun change(value: Note, record: Boolean = true, typing: Boolean = false) {
+        if (reviewingBackup) return
         val old = note ?: return
         if (old == value) return
         if (record && editing) history.record(old, typing)
@@ -181,22 +194,50 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
             try { repository.reorderVisible(ids) } finally { finished() }
         }
     }
-    fun undo() { note?.let { n -> history.undo(n)?.let { changeEditorContent(it, false) } } }
-    fun redo() { note?.let { n -> history.redo(n)?.let { changeEditorContent(it, false) } } }
+    fun undo() { if (reviewingBackup) return; note?.let { n -> history.undo(n)?.let { changeEditorContent(it, false) } } }
+    fun redo() { if (reviewingBackup) return; note?.let { n -> history.redo(n)?.let { changeEditorContent(it, false) } } }
     /** Enters editing with the cursor in the title, or in the body at [bodyOffset]. */
     fun enterEditing(bodyOffset: Int? = null) {
+        if (reviewingBackup) return
         editorInteracted(if (bodyOffset == null) HitKind.TITLE else HitKind.BODY, bodyOffset ?: 0)
         editing = true; focusTitle = bodyOffset == null; bodyFocus = bodyOffset
     }
     suspend fun flush() = repository.flush()
     fun back() {
+        if (reviewingBackup) return
         if (screen == Screen.NOTE && findOpen) { closeFind(); return }
         if (screen == Screen.IMAGE) { imageId = null; screen = Screen.NOTE; return }
         if (screen != Screen.NOTE) { screen = Screen.LIST; query = ""; results = emptyList(); choosingDestination = false; return }
         leaveNote()
     }
     /** Done finishes editing in one action even when Find is open. Failed saves retain editing. */
-    fun finishEditing() { clearFind(); focusTitle = false; bodyFocus = null; leaveNote() }
+    fun finishEditing() { if (reviewingBackup) return; clearFind(); focusTitle = false; bodyFocus = null; leaveNote() }
+    /** Settings navigation completes the entire session, including an image's underlying note. */
+    fun reviewBackup() {
+        if (reviewingBackup || !app.unlocked.value) return
+        reviewingBackup = true
+        val job = app.scope.launch(start = CoroutineStart.LAZY) {
+            operationMutex.withLock {
+                if (!app.unlocked.value) return@withLock
+                try {
+                    if (note != null) {
+                        flush()
+                        if (newDraft && note?.isEmpty == true) note?.let { repository.delete(it.id) }
+                        endSession()
+                    }
+                    clearFind(); searchJob?.cancel(); query = ""; results = emptyList(); hit = null
+                    note = null; editing = false; newDraft = false; imageId = null
+                    focusTitle = false; bodyFocus = null; choosingDestination = false
+                    rememberEditorSelection(HitKind.TITLE, 0)
+                    screen = Screen.SETTINGS
+                } catch (e: CancellationException) { throw e }
+                catch (_: Exception) { error = app.getString(R.string.backup_navigation_save_failed) }
+            }
+        }
+        operations += job
+        job.invokeOnCompletion { operations.remove(job); reviewingBackup = false }
+        job.start()
+    }
     private fun leaveNote() {
         task(null, "Changes could not be saved. Please free some storage before leaving this note.") {
             flush()
@@ -276,7 +317,9 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     fun submitPassword(password: CharArray) {
         passwordMode = null
         task("Validating backup…", "The backup could not be restored. Check the passphrase, file integrity, version, and available storage.") {
-            try { restoreCount = backups.stage(checkNotNull(restoreUri), password, ::progress) } finally { password.fill('\u0000') }
+            try { restoreCount = backups.stage(checkNotNull(restoreUri), password, ::progress) }
+            catch (_: dev.securenotes.backup.BackupPasswordException) { passwordMode = "restore"; error = "Incorrect recovery phrase or damaged backup. You can try again." }
+            finally { password.fill('\u0000') }
         }
         operation?.invokeOnCompletion { password.fill('\u0000') }
     }
@@ -284,28 +327,75 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
         restoreAfterUnlock = false
         if (uri == null) return
         task("Checking backup…", "This file is not a supported Notes backup, is incomplete, or could not be read.") {
-            backups.checkHeader(uri); restoreUri = uri; passwordMode = "restore"
+            backups.checkHeader(uri); restoreUri = uri
+            val words = if (repository.passphraseConfirmed.value == true) repository.access { it.passphrase() }?.toCharArray() else null
+            if (words == null) passwordMode = "restore"
+            else try { restoreCount = backups.stage(uri, words, ::progress) }
+            catch (_: dev.securenotes.backup.BackupPasswordException) { passwordMode = "restore" }
+            finally { words.fill('\u0000') }
         }
     }
     fun confirmPassphrase() { task(null, "The confirmation could not be saved.") { repository.confirmPassphrase() } }
     /** Called by the activity only after a fresh vault-key authentication. */
     fun revealPassphrase() { task(null, "The recovery passphrase could not be read.") { revealedWords = repository.passphrase().split(' ') } }
-    private val unusableLocation = "That location can't be used for automatic backups. Choose a file in another location, for example in Files or Dropbox."
-    fun chooseBackup(uri: Uri?) {
-        if (uri == null) return
-        task("Checking backup file…", unusableLocation) {
-            if (app.autoBackup.containsBackup(uri)) replaceBackup = uri
-            else app.keepAlive { flush(); app.autoBackup.choose(uri) }
+    fun finishPhraseReview() {
+        revealedWords?.let { app.autoBackup.phraseReviewed(dev.securenotes.backup.BackupService.phraseHash(it.joinToString(" "))) }
+        revealedWords = null
+    }
+    fun canChooseBackup(): Boolean {
+        val admission = app.backupScheduler.admission()
+        if (activeOperation != null || !admission.accepted) {
+            app.autoBackup.rejectSetup(if (admission.accepted) BackupAdmission.BUSY else admission)
+            return false
         }
+        return true
     }
-    fun confirmReplaceBackup() {
-        val uri = replaceBackup ?: return
-        replaceBackup = null
-        task("Saving encrypted backup…", unusableLocation) { app.keepAlive { flush(); app.autoBackup.choose(uri) } }
+    /** Called immediately before launch. Re-selection keeps the same reservation through the warning. */
+    fun launchBackupPicker(launch: () -> Unit) {
+        if (pendingBackupPicker != null) { app.autoBackup.rejectSetup(BackupAdmission.BUSY); return }
+        if (backupSetupToken != null && !app.backupScheduler.isCurrent(backupSetupToken)) backupSetupToken = null
+        if (backupSetupToken == null) {
+            if (activeOperation != null) { app.autoBackup.rejectSetup(BackupAdmission.BUSY); return }
+            val result = app.backupScheduler.beginSetup()
+            if (!result.admission.accepted) return
+            backupSetupToken = result.token
+        }
+        backupProviderWarning = null
+        pendingBackupPicker = backupSetupToken
+        try { launch() }
+        catch (_: Exception) { pendingBackupPicker = null; cancelBackupSelection(); error = app.getString(R.string.backup_picker_failed) }
     }
-    fun restoreChosenBackup() { val uri = replaceBackup ?: return; replaceBackup = null; selectRestore(uri) }
-    fun backupNow() { task("Saving encrypted backup…", "The backup could not be saved.") { app.keepAlive { flush(); app.autoBackup.run(force = true, progress = ::progress) } } }
-    fun turnOffBackup() { task(null, "Automatic backup settings could not be saved.") { app.autoBackup.turnOff() } }
+    fun cancelBackupSelection() {
+        app.backupScheduler.cancelSetup(backupSetupToken)
+        backupSetupToken = null; backupProviderWarning = null
+    }
+    fun chooseBackup(uri: Uri?) {
+        val token = pendingBackupPicker
+        pendingBackupPicker = null
+        if (uri == null) {
+            app.backupScheduler.cancelSetup(token)
+            if (backupSetupToken === token) { backupSetupToken = null; backupProviderWarning = null }
+            return
+        }
+        if (!app.backupScheduler.isCurrent(token)) {
+            app.autoBackup.rejectSetup(BackupAdmission.SELECT_AGAIN); return
+        }
+        if (uri.authority !in setOf("com.android.externalstorage.documents", "com.android.providers.downloads.documents")) backupProviderWarning = uri
+        else submitBackupSetup(token, uri)
+    }
+    fun acceptBackupProvider() {
+        val uri = backupProviderWarning ?: return
+        backupProviderWarning = null
+        submitBackupSetup(backupSetupToken, uri)
+    }
+    private fun submitBackupSetup(token: BackupSetupToken?, uri: Uri) {
+        val result = app.backupScheduler.submitSetup(token, uri.toString())
+        // Accepted (including queued) work belongs to the process-wide scheduler, not this Activity.
+        if (result.admission.accepted && backupSetupToken === token) backupSetupToken = null
+    }
+    fun checkBackupAccess() { if (canChooseBackup()) app.backupScheduler.refreshAccess() }
+    fun backupNow() { if (canChooseBackup()) app.backupScheduler.manual() }
+    fun turnOffBackup() { if (canChooseBackup()) app.backupScheduler.disable() }
     fun restore() {
         restoreCount = null
         task("Replacing notes…", "Restore could not be completed. Existing data has been retained where possible.") {
@@ -339,6 +429,7 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
         finder.cancelScroll(); findScrollTarget = null; findScrollRevision++; findReturn = null
     }
     fun openFind() {
+        if (reviewingBackup) return
         clearFind(); findActionRevision = editorRevision
         findOpen = true; focusTitle = false; bodyFocus = null
     }
@@ -376,5 +467,5 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
         finder.clear(); findOpen = false; findReturn = null
         findScrollTarget = null; findScrollRevision++
     }
-    override fun onCleared() { backups.discard() }
+    override fun onCleared() { cancelBackupSelection(); backups.discard() }
 }

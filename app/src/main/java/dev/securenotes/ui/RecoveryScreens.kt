@@ -82,7 +82,7 @@ private val wordKeyboard = KeyboardOptions(capitalization = KeyboardCapitalizati
     }
 }
 
-@Composable fun RevealPassphraseDialog(words: List<String>, dismiss: () -> Unit) {
+@Composable fun RevealPassphraseDialog(words: List<String>, dismiss: () -> Unit, reviewed: () -> Unit = dismiss) {
     val scroll = rememberScrollState()
     AlertDialog(onDismissRequest = dismiss, properties = secureDialog, title = { Text("Recovery passphrase") }, text = {
         Column(Modifier.verticalScrollbar(scroll).verticalScroll(scroll).padding(end = 12.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -90,7 +90,7 @@ private val wordKeyboard = KeyboardOptions(capitalization = KeyboardCapitalizati
             CopyWordsButton(words)
             Text("These words open your notes and backups on any phone. Never share them.", color = MaterialTheme.colorScheme.error)
         }
-    }, confirmButton = { TextButton(onClick = dismiss) { Text("Done") } })
+    }, confirmButton = { TextButton(onClick = reviewed) { Text("Done") } })
 }
 
 /** Entry for an existing passphrase: same-device recovery, or the passphrase that encrypted a backup. */

@@ -1,135 +1,273 @@
 package dev.securenotes.backup
 
-import android.content.Context
-import android.content.Intent
-import android.net.Uri
-import android.provider.OpenableColumns
-import dev.securenotes.storage.NotesRepository
-import dev.securenotes.storage.SecretRow
-import dev.securenotes.storage.Vault
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
-import java.io.File
+import java.time.Instant
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
 
-/**
- * Keeps one user-chosen document (any Storage Access Framework provider, e.g. Dropbox) overwritten with the latest
- * passphrase-encrypted backup. The provider app performs any upload; this app still has no network access.
- */
-class AutoBackup(private val context: Context, private val repository: NotesRepository, private val backups: BackupService) {
-    companion object {
-        private const val URI = "backup-uri"
-        private const val NAME = "backup-name"
-        private const val FINGERPRINT = "backup-fingerprint"
-        private const val SAVED_AT = "backup-saved-at"
-        private const val ERROR = "backup-error"
-        /** Destination settings follow the device across a restore; status does not. */
-        val DEVICE_SECRETS = listOf(URI, NAME)
-        const val QUIET_MILLIS = 60_000L
-        private const val FLAGS = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+/** Serializes destination mutations. Only verified ciphertext is ever published as active. */
+class AutoBackup(
+    private val files: BackupFiles,
+    private val settings: BackupSettingsStore,
+    private val source: BackupSource,
+    private val unlocked: () -> Boolean,
+    private val clock: () -> Long = System::currentTimeMillis,
+    private val io: CoroutineDispatcher = Dispatchers.IO,
+) {
+    companion object { const val QUIET_MILLIS = 60_000L }
+    private val mutex = Mutex()
+    private val mutableStatus = MutableStateFlow<BackupStatus?>(null)
+    val status = mutableStatus.asStateFlow()
+    @Volatile private var trusted: BackupConfiguration? = null
+    @Volatile private var operation: String? = null
+    private var setupError: BackupError? = null
+    @Volatile private var transientError: BackupError? = null
+    @Volatile private var restartRequired = false
+    private var visible = false
+    @Volatile private var savedRevision: Long? = null
+    private var reviewedPhrase: String? = null
+    @Volatile private var inspection: BackupInspection? = null
+    // Revisions are process-local counters. Never trust a revision decoded from a previous process.
+    @Volatile private var oversizedRevision: Long? = null
+    @Volatile private var grantAvailable: Boolean? = null
+    val busy: Boolean get() = mutex.isLocked
+    fun admission(): BackupAdmission = when {
+        !unlocked() -> BackupAdmission.LOCKED
+        restartRequired -> BackupAdmission.RESTART_REQUIRED
+        busy -> BackupAdmission.BUSY
+        trusted == null -> BackupAdmission.UNAVAILABLE
+        else -> BackupAdmission.ACCEPTED
     }
-    data class Status(val location: String?, val savedAt: Long?, val error: String?)
-    private class LostPermission : Exception()
-    private class IncompleteWrite : Exception()
-    val status = MutableStateFlow<Status?>(null)
-    private val running = Mutex()
-    /** The [NotesRepository.changes] count the destination is known to hold; null when unknown. */
-    @Volatile private var savedChange: Long? = null
-    /** False when the destination already holds the current content, so leaving the app needs nothing kept running. */
-    fun mayWrite(pendingEdits: Boolean) = status.value?.location != null && (pendingEdits || repository.changes.value != savedChange)
-    /** True when [uri] already holds a Notes backup, which choosing it as the destination would overwrite. */
-    suspend fun containsBackup(uri: Uri): Boolean = withContext(Dispatchers.IO) {
-        try { context.contentResolver.openInputStream(uri)?.use { BackupCodec.validateHeader(it); true } ?: false }
-        catch (e: CancellationException) { throw e } catch (_: Exception) { false }
+    fun canMutate() = admission().accepted
+    fun rejectSetup(reason: BackupAdmission): BackupAdmission {
+        setupError = BackupError(when (reason) {
+            BackupAdmission.RESTART_REQUIRED -> BackupProblem.RESTART_REQUIRED
+            BackupAdmission.SELECT_AGAIN, BackupAdmission.LOCKED -> BackupProblem.SELECT_AGAIN
+            BackupAdmission.PHRASE_REVIEW_REQUIRED -> BackupProblem.PHRASE_CHANGED
+            else -> BackupProblem.BUSY
+        }, "setup-admission")
+        publish(); return reason
     }
-
-    private suspend fun Vault.text(name: String) = dao.secret(name)?.toString(Charsets.UTF_8)
-    private suspend fun Vault.put(name: String, value: String) = dao.putSecret(SecretRow(name, value.toByteArray(Charsets.UTF_8)))
-    suspend fun refresh() {
-        status.value = repository.access { v -> Status(v.text(NAME), v.text(SAVED_AT)?.toLongOrNull(), v.text(ERROR)) }
+    fun clearSetupError() { setupError = null; publish() }
+    fun setupFlushFailed() { setupError = BackupError(BackupProblem.IO, "flush"); publish() }
+    @Synchronized fun clearStatus() { visible = false; reviewedPhrase = null; mutableStatus.value = null }
+    @Synchronized private fun publish() {
+        mutableStatus.value = if (visible && unlocked()) BackupStatus(trusted ?: BackupConfiguration(), operation, transientError ?: trusted?.error, setupError, restartRequired, grantAvailable) else null
     }
-    fun clearStatus() { status.value = null }
-    /** [uri] comes from ACTION_CREATE_DOCUMENT; the grant must be persistable so later backups need no picker. */
-    suspend fun choose(uri: Uri) {
-        try { context.contentResolver.takePersistableUriPermission(uri, FLAGS) }
-        catch (_: SecurityException) { throw IllegalStateException("That location does not allow repeated saving") }
-        val name = runCatching {
-            context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
-        }.getOrNull() ?: "Backup file"
+    suspend fun refresh() = mutex.withLock {
+        visible = unlocked()
+        if (!restartRequired) try { trusted = settings.load().also { it.validate() }; transientError = null }
+        catch (e: CancellationException) { throw e }
+        catch (_: Exception) { restartRequired = true; transientError = BackupError(BackupProblem.INVALID_CONFIGURATION, "load") }
+        refreshGrant()
+        publish()
+    }
+    /** The only cached eligibility input requiring a provider; never call it from composition. */
+    suspend fun refreshGrant() {
+        val folder = trusted?.grant
+        val available = if (folder == null) null else withContext(io) {
+            try { files.hasGrant(folder) }
+            catch (e: CancellationException) { throw e }
+            catch (_: Exception) { false }
+        }
+        if (trusted?.grant == folder) { grantAvailable = available; publish() }
+    }
+    private suspend fun requireGrant(folder: String) = withContext(io) {
         try {
-            repository.access { v ->
-                v.text(URI)?.let(Uri::parse)?.takeIf { it != uri }?.let { old -> runCatching { context.contentResolver.releasePersistableUriPermission(old, FLAGS) } }
-                v.put(URI, uri.toString()); v.put(NAME, name.take(256))
-                listOf(FINGERPRINT, SAVED_AT, ERROR).forEach { v.dao.deleteSecret(it) }
-            }
-        } catch (e: Exception) { runCatching { context.contentResolver.releasePersistableUriPermission(uri, FLAGS) }; throw e }
-        run(force = true)
-    }
-    suspend fun turnOff() {
-        repository.access { v ->
-            v.text(URI)?.let(Uri::parse)?.let { runCatching { context.contentResolver.releasePersistableUriPermission(it, FLAGS) } }
-            (DEVICE_SECRETS + listOf(FINGERPRINT, SAVED_AT, ERROR)).forEach { v.dao.deleteSecret(it) }
+            val available = files.hasGrant(folder)
+            if (trusted?.grant == folder) grantAvailable = available
+            if (!available) throw BackupFailure(BackupProblem.ACCESS)
+        } catch (e: Exception) {
+            if (e.hasSecurityCause() && trusted?.grant == folder) grantAvailable = false
+            throw e
         }
-        refresh()
     }
-    /** Writes a new backup when content changed since the last successful one (or always, when [force]). */
-    suspend fun run(force: Boolean = false, progress: (String) -> Unit = {}) {
-        running.withLock {
-            val change = repository.changes.value
-            val (uri, last) = repository.access { v -> v.text(URI)?.let(Uri::parse) to v.text(FINGERPRINT) }
-            var unrecorded: String? = null
-            // Shown with unexpected failures so a provider problem can be diagnosed without device logs.
-            var step = "encrypt"
-            if (uri != null) try {
-                if (context.contentResolver.persistedUriPermissions.none { it.uri == uri && it.isWritePermission }) throw LostPermission()
-                val created = backups.create(progress, if (force) null else last)
-                if (created != null) {
-                    val (file, fingerprint) = created
-                    // The file is already ciphertext, so finishing the copy after a lock leaks nothing and avoids a truncated backup.
-                    try { withContext(NonCancellable + Dispatchers.IO) { write(uri, file) { step = it } } } finally { file.delete() }
-                    step = "record"
-                    repository.access { v -> v.put(FINGERPRINT, fingerprint); v.put(SAVED_AT, System.currentTimeMillis().toString()); v.dao.deleteSecret(ERROR) }
-                }
-                savedChange = change
+    /** The caller enforces fresh authentication. Approval applies only to this session and phrase. */
+    fun phraseReviewed(hash: String) { if (unlocked()) reviewedPhrase = hash }
+    fun setupNeedsReview() = status.value?.error?.problem == BackupProblem.PHRASE_CHANGED && reviewedPhrase == null
+    private fun eligible(config: BackupConfiguration, force: Boolean, pendingEdits: Boolean = false): Boolean {
+        if (!unlocked() || restartRequired || config.mode != BackupMode.PAIR) return false
+        return when ((transientError ?: config.error)?.problem) {
+            BackupProblem.ACCESS -> grantAvailable == true
+            BackupProblem.MANIFEST_TOO_LARGE -> pendingEdits || oversizedRevision != source.revision
+            BackupProblem.PHRASE_CHANGED, BackupProblem.PHRASE_MISSING, BackupProblem.ACTIVE_DAMAGED,
+            BackupProblem.INVALID_CONFIGURATION, BackupProblem.RESTART_REQUIRED -> false
+            else -> force || pendingEdits || config.pending || config.error != null || transientError != null || savedRevision != source.revision
+        }
+    }
+    fun mayWrite(pendingEdits: Boolean = false, force: Boolean = false): Boolean {
+        val config = trusted ?: return false
+        if (operation != null) return true
+        if (!eligible(config, force, pendingEdits)) return false
+        return force || pendingEdits || inspection?.takeIf { it.revision == source.revision }?.empty != true
+    }
+    /** Metadata only: no attachment stream or password derivation. */
+    suspend fun refreshFingerprint() {
+        if (!canMutate() || trusted?.mode != BackupMode.PAIR) return
+        mutex.withLock {
+            try {
+                inspection = source.inspect()
+                val config = checkNotNull(trusted)
+                if (!config.pending && config.error == null && transientError == null && inspection?.fingerprint == config.fingerprint) savedRevision = inspection?.revision
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) {
-                savedChange = null
-                val message = when (e) {
-                    is LostPermission, is SecurityException -> "Notes can no longer write to the backup file. Choose the backup location again."
-                    is IncompleteWrite -> "This backup location didn't replace the previous backup cleanly, so the file may not restore. Choose a different backup file or location."
-                    // Exception types and errno names only: messages can contain file names or URIs.
-                    else -> "The latest automatic backup could not be saved. Check the backup location and available storage. " +
-                        "(Failed at $step: ${describe(e)}${e.cause?.let { " / " + describe(it) } ?: ""})"
-                }
-                // Recording the failure can itself fail (for example on a full disk); then it is shown from memory.
-                try { repository.access { v -> v.put(ERROR, message) } }
-                catch (c: CancellationException) { throw c } catch (_: Exception) { unrecorded = message }
-            }
-            refresh()
-            unrecorded?.let { message -> status.value = (status.value ?: Status(null, null, null)).copy(error = message) }
+            catch (_: Exception) { /* The normal attempt reports source failures. */ }
         }
     }
-    private fun describe(e: Throwable) = e.javaClass.simpleName +
-        ((e as? android.system.ErrnoException)?.let { " " + (android.system.OsConstants.errnoName(it.errno) ?: it.errno.toString()) } ?: "")
-    private fun write(uri: Uri, file: File, step: (String) -> Unit) {
-        val resolver = context.contentResolver
-        // Prefer modes that truncate; accepting one is the provider's promise to replace the old backup. Reading back is then
-        // skipped because providers that upload after close (e.g. Dropbox) still report the previous copy's size.
-        // "rwt" comes first because read/write modes imply a seekable file, whereas "wt" may be a pipe: Dropbox opened
-        // "wt" and then failed mid-write. Fallback happens only when opening fails, never after a failed write.
-        step("open")
-        val (mode, output) = listOf("rwt", "wt").firstNotNullOfOrNull { m -> runCatching { resolver.openOutputStream(uri, m) }.getOrNull()?.let { m to it } }
-            ?: ("w" to checkNotNull(resolver.openOutputStream(uri, "w")))
-        step("write $mode")
-        output.use { out -> file.inputStream().use { it.copyTo(out, 64 * 1024) }; step("close $mode") }
-        if (mode != "w") return
-        step("verify")
-        // Plain "w" may not truncate, and old bytes left after a shorter backup would make the file fail authentication on restore.
-        val size = runCatching { resolver.openFileDescriptor(uri, "r")?.use { it.statSize } }.getOrNull() ?: -1L
-        if (size >= 0 && size != file.length()) throw IncompleteWrite()
+    private suspend fun persist(next: BackupConfiguration, began: () -> Unit = {}) {
+        var started = false
+        try {
+            settings.save(next) { started = true; began() }
+            trusted = next; transientError = null
+        } catch (e: Exception) {
+            if (started) { restartRequired = true; transientError = BackupError(BackupProblem.RESTART_REQUIRED, "record", files.diagnostic(e)); publish() }
+            throw e
+        }
+    }
+    private fun error(e: Exception, step: String): BackupError = BackupError(when {
+        e.hasSecurityCause() -> BackupProblem.ACCESS
+        e is BackupFailure -> e.problem
+        e is ManifestTooLarge -> BackupProblem.MANIFEST_TOO_LARGE
+        else -> BackupProblem.IO
+    }, step, files.diagnostic(e))
+
+    suspend fun run(force: Boolean = false, progress: (String) -> Unit = {}) = mutex.withLock {
+        val config = trusted ?: return@withLock
+        if (!eligible(config, force)) return@withLock
+        var step = "inspect"
+        operation = step; publish()
+        fun report(value: String) { step = value; operation = value; publish() }
+        try {
+            config.validate()
+            requireGrant(checkNotNull(config.folder))
+            val metadata = source.inspect().also { inspection = it }
+            if (metadata.phraseHash != config.phraseHash) throw BackupFailure(BackupProblem.PHRASE_CHANGED)
+            if (!force && metadata.empty) return@withLock
+            if (!force && !config.pending && config.error == null && transientError == null && metadata.fingerprint == config.fingerprint) {
+                savedRevision = metadata.revision; return@withLock
+            }
+            // Fail before encryption/KDF work for an unreadable or already damaged active file.
+            withContext(io) { report("verify-active"); requireGrant(checkNotNull(config.folder)); files.verify(config.slots[config.active]) }
+            report("prepare")
+            source.prepare(progress).use { artifact ->
+                if (artifact.content.phraseHash != config.phraseHash) throw BackupFailure(BackupProblem.PHRASE_CHANGED)
+                if (!force && artifact.content.empty) return@withLock
+                // The provider may have changed while encryption ran. Verify again just before writing.
+                withContext(io) { report("verify-active"); requireGrant(checkNotNull(config.folder)); files.verify(config.slots[config.active]) }
+                // Lock before the write begins is cancellation, not an uncertain commit.
+                report("record-pending"); persist(config.copy(pending = true))
+                withContext(NonCancellable + io) {
+                    val inactive = 1 - config.active
+                    report("access"); requireGrant(checkNotNull(config.folder))
+                    files.writeVerified(config.slots[inactive].uri, artifact, ::report)
+                    val slots = config.slots.toMutableList().also { it[inactive] = it[inactive].copy(length = artifact.length, sha256 = artifact.sha256) }
+                    report("record-success")
+                    persist(config.copy(slots = slots, active = inactive, fingerprint = artifact.content.fingerprint, savedAt = clock(), pending = false, error = null))
+                    savedRevision = artifact.content.revision; oversizedRevision = null
+                }
+            }
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) {
+            savedRevision = null
+            if (e is ManifestTooLarge) oversizedRevision = e.revision
+            if (!restartRequired) {
+                // Inactive read-back failure retries; damaged active evidence requires a new pair.
+                val failure = error(e, step).let { if (it.problem == BackupProblem.ACTIVE_DAMAGED && step != "verify-active") it.copy(problem = BackupProblem.IO) else it }
+                if (failure.problem == BackupProblem.ACCESS) grantAvailable = false
+                transientError = failure
+                try { persist(checkNotNull(trusted).copy(error = failure)) }
+                catch (_: CancellationException) { /* Durable pending survives a lock. */ }
+                catch (_: Exception) { /* persist set the restart block. */ }
+            }
+        } finally { operation = null; publish() }
+    }
+
+    /** Reject delayed picker callbacks when busy. Never adopt a document by name. */
+    suspend fun choose(folder: String, progress: (String) -> Unit = {}): BackupAdmission {
+        val admission = admission()
+        if (!admission.accepted) return rejectSetup(admission)
+        if (!mutex.tryLock()) return rejectSetup(BackupAdmission.BUSY)
+        val old = checkNotNull(trusted)
+        val created = mutableListOf<String>()
+        var hadGrant = true
+        var commitStarted = false
+        var committed = false
+        var step = "prepare"
+        operation = "setup"; setupError = null; publish()
+        try {
+            if (!unlocked()) return rejectSetup(BackupAdmission.LOCKED)
+            if (restartRequired) return rejectSetup(BackupAdmission.RESTART_REQUIRED)
+            source.prepare(progress).use { artifact ->
+                if (old.mode == BackupMode.PAIR && old.phraseHash != artifact.content.phraseHash && reviewedPhrase != artifact.content.phraseHash) throw BackupFailure(BackupProblem.PHRASE_CHANGED)
+                currentCoroutineContext().ensureActive()
+                if (!unlocked()) throw CancellationException()
+                withContext(io) {
+                    hadGrant = files.hasAnyGrant(folder)
+                    files.retain(folder)
+                    requireGrant(folder)
+                }
+                val timestamp = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmssSSS'Z'").withZone(ZoneOffset.UTC).format(Instant.ofEpochMilli(clock()))
+                val slots = withContext(io) {
+                    listOf("A", "B").map { label ->
+                        currentCoroutineContext().ensureActive()
+                        step = "create-$label"
+                        requireGrant(folder)
+                        val requested = "Notes-$timestamp-$label.ssnb"
+                        val uri = files.create(folder, requested)
+                        if (uri.isBlank() || uri in old.managedUris || uri in created) throw BackupFailure(BackupProblem.INVALID_CONFIGURATION)
+                        created += uri
+                        val document = files.document(uri, requested)
+                        files.writeVerified(document.uri, artifact) { step = it; operation = "setup-$it"; publish() }
+                        BackupSlot(document.uri, document.name, artifact.length, artifact.sha256, document.nameConfirmed)
+                    }
+                }
+                val next = BackupConfiguration(mode = BackupMode.PAIR, folder = folder, slots = slots, active = 1,
+                    phraseHash = artifact.content.phraseHash, fingerprint = artifact.content.fingerprint, savedAt = clock())
+                next.validate(); step = "record-setup"
+                persist(next) { commitStarted = true }
+                committed = true; savedRevision = artifact.content.revision; oversizedRevision = null; reviewedPhrase = null; grantAvailable = true
+            }
+            return BackupAdmission.ACCEPTED
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) { setupError = error(e, step); return BackupAdmission.FAILED }
+        finally {
+            withContext(NonCancellable + io) {
+                if (!commitStarted) {
+                    created.forEach { runCatching { files.delete(it) } }
+                    if (!hadGrant && folder != old.grant) runCatching { files.release(folder) }
+                } else if (committed) old.grant?.takeIf { it != folder }?.let { runCatching { files.release(it) } }
+            }
+            operation = null; publish(); mutex.unlock()
+        }
+    }
+    suspend fun turnOff(): BackupAdmission {
+        val admission = admission()
+        if (!admission.accepted) return admission
+        if (!mutex.tryLock()) return BackupAdmission.BUSY
+        try {
+            val old = checkNotNull(trusted)
+            persist(BackupConfiguration())
+            withContext(NonCancellable + io) { old.grant?.let { runCatching { files.release(it) } } }
+            savedRevision = null; oversizedRevision = null; setupError = null; grantAvailable = null
+            return BackupAdmission.ACCEPTED
+        } finally { publish(); mutex.unlock() }
+    }
+    /** Lock order: coordinator -> repository. Staging never holds the coordinator lock. */
+    suspend fun publishRestore(phraseHash: String, publishVault: suspend (BackupConfiguration, () -> Unit) -> Unit) = mutex.withLock {
+        val latest = settings.load().also { it.validate() }
+        val next = latest.afterRestore(phraseHash)
+        operation = "restore"; publish()
+        var began = false
+        try {
+            publishVault(next) { began = true }
+            trusted = next; savedRevision = null; oversizedRevision = null; inspection = null; reviewedPhrase = null
+            if (!restartRequired) transientError = null
+        } catch (e: Exception) {
+            if (began) { restartRequired = true; transientError = BackupError(BackupProblem.RESTART_REQUIRED, "restore-publication", files.diagnostic(e)) }
+            throw e
+        } finally { operation = null; publish() }
     }
 }

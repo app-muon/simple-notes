@@ -3,6 +3,9 @@ package dev.securenotes
 import android.app.Application
 import android.app.KeyguardManager
 import android.content.*
+import dev.securenotes.backup.AndroidBackupFiles
+import dev.securenotes.backup.VaultBackupSettings
+import dev.securenotes.backup.BackupScheduler
 import dev.securenotes.backup.AutoBackup
 import dev.securenotes.backup.BackupKeepAlive
 import dev.securenotes.backup.BackupService
@@ -12,7 +15,6 @@ import dev.securenotes.security.ResumeSession
 import dev.securenotes.storage.NotesRepository
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -31,7 +33,8 @@ class NotesApplication : Application() {
         private set
     lateinit var autoBackup: AutoBackup
         private set
-    private var backupJob: Job? = null
+    lateinit var backupScheduler: BackupScheduler
+        private set
     @Volatile private var authorized = false
     private var indexing: Job? = null
     private var closing: Job? = null
@@ -71,13 +74,18 @@ class NotesApplication : Application() {
     suspend fun <T> keepAlive(block: suspend () -> T): T { val release = keepAlive(); try { return block() } finally { release() } }
     override fun onCreate() {
         super.onCreate()
+        // Remove only the obsolete audible channel; preserve the current silent channel and its settings.
+        getSystemService(android.app.NotificationManager::class.java).deleteNotificationChannel("backup")
         System.loadLibrary("sqlcipher")
         keys = DeviceKeys(this)
         resumeSession = ResumeSession(android.os.SystemClock::elapsedRealtime, keys::sealResume, keys::openResume)
         repository = NotesRepository(this, ::checkAccess)
         camera = dev.securenotes.storage.CameraCapture(this, repository)
         backups = BackupService(this, repository, ::checkAccess)
-        autoBackup = AutoBackup(this, repository, backups)
+        autoBackup = AutoBackup(AndroidBackupFiles(this), VaultBackupSettings(repository), backups, { unlocked.value })
+        backups.coordinator = autoBackup
+        backupScheduler = BackupScheduler(scope, autoBackup, repository.changes, { unlocked.value }, repository::hasPendingEdits,
+            repository::flush, { keepAlive() }, { repository.issue.value = "Recent changes could not be saved. Free storage and retry." })
         registerReceiver(object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
                 when (intent.action) {
@@ -117,12 +125,12 @@ class NotesApplication : Application() {
                     // disk), the notes still open so the user can free space; setup is retried on the next unlock.
                     try { repository.ensurePassphrase { Passphrase.generate(Passphrase.wordlist(this@NotesApplication)) } }
                     catch (e: CancellationException) { throw e }
-                    catch (_: Exception) { repository.issue.value = "Your recovery passphrase could not be set up, probably because storage is full. Free some space; Notes will try again the next time you unlock." }
+                    catch (_: Exception) { repository.issue.value = "Your recovery passphrase is unavailable. Backups are paused. Free storage and unlock again; if the problem remains, restore a backup using your saved recovery words." }
                     // Setup suspends for key derivation and storage. A lock can revoke this session while it runs.
                     if (expectedEpoch != sessionEpoch.get()) throw CancellationException("Session changed")
                     checkAccess()
                     if (authenticatedAt == null && resumeSession.remainingMillis() == 0L) throw CancellationException("Resume expired")
-                    unlocked.value = true; screenOff = false; startIndexing(); startAutoBackup()
+                    unlocked.value = true; screenOff = false; startIndexing(); backupScheduler.onUnlocked()
                 } catch (e: Exception) {
                     authorized = false; unlocked.value = false; repository.close(); throw e
                 }
@@ -147,32 +155,11 @@ class NotesApplication : Application() {
     fun lock() {
         if (!authorized) return
         sessionEpoch.incrementAndGet(); repository.freezeEdits()
-        authorized = false; unlocked.value = false; indexing?.cancel(); backupJob?.cancel(); autoBackup.clearStatus(); revokeGrants()
+        authorized = false; unlocked.value = false; indexing?.cancel(); backupScheduler.onLocked(); revokeGrants()
         closing = scope.launch { sessionMutex.withLock { repository.close() } }
     }
-    /** Flushes edits, then refreshes the automatic backup if content changed (backgrounding is a natural checkpoint). */
-    fun flushEdits() { if (unlocked.value) {
-        // Called while still visible, the last chance to keep the process running; skipped when nothing needs writing.
-        val release = if (autoBackup.mayWrite(repository.hasPendingEdits())) keepAlive() else null
-        scope.launch {
-            try {
-                try { repository.flush() } catch (_: CancellationException) { return@launch } catch (_: Exception) { repository.issue.value = "Recent changes could not be saved. Free storage and retry."; return@launch }
-                try { autoBackup.run() } catch (_: Exception) { /* Locked or recorded in the backup status. */ }
-            } finally { release?.invoke() }
-        }
-    } }
-    @OptIn(kotlinx.coroutines.FlowPreview::class)
-    private fun startAutoBackup() {
-        backupJob?.cancel()
-        // Each attempt is isolated so one failure never stops later changes from being backed up.
-        suspend fun attempt() { try { autoBackup.run() } catch (e: CancellationException) { throw e } catch (_: Exception) { /* Shown in the backup status. */ } }
-        backupJob = scope.launch {
-            try {
-                attempt()
-                repository.changes.debounce(AutoBackup.QUIET_MILLIS).collect { attempt() }
-            } catch (_: CancellationException) { /* Locked. */ }
-        }
-    }
+    fun flushEdits() { backupScheduler.onLeaving() }
+    fun onForeground() { backupScheduler.onForeground() }
     fun startIndexing() {
         if (indexing?.isActive == true) return
         indexing = scope.launch {

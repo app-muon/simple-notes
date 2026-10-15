@@ -58,6 +58,9 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.securenotes.backup.BackupMode
+import dev.securenotes.backup.BackupProblem
+import dev.securenotes.backup.BackupError
 import dev.securenotes.R
 import dev.securenotes.document.*
 import kotlinx.coroutines.delay
@@ -146,9 +149,12 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
         uris.forEach { runCatching { context.contentResolver.takePersistableUriPermission(it, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION) } }
         vm.import(uris)
     }
-    val backupPicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream"), vm::chooseBackup)
+    val backupPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree(), vm::chooseBackup)
     val restorePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument(), vm::selectRestore)
     val chooseRestore = { restorePicker.launch(arrayOf("*/*")) }
+    val chooseBackup = { if (vm.canChooseBackup()) { if (vm.app.autoBackup.setupNeedsReview()) reveal() else vm.launchBackupPicker { backupPicker.launch(null) } } }
+    val backupStatus by vm.app.autoBackup.status.collectAsStateWithLifecycle()
+    val banner = if (vm.screen != Screen.SETTINGS) backupBannerMessage(backupStatus) else null
     LaunchedEffect(vm.restoreAfterUnlock) { if (vm.restoreAfterUnlock) chooseRestore() }
     val back = { if (!vm.findOpen) { keyboard?.hide(); focus.clearFocus() }; vm.back() }
     BackHandler(enabled = vm.screen != Screen.LIST || vm.choosingDestination, onBack = back)
@@ -175,26 +181,27 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
         vm.restoreAfterUnlock -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Choose a Notes backup file") }
         // Nothing else is reachable until the recovery passphrase has been confirmed.
         vm.setupWords != null -> PassphraseSetupScreen(vm, chooseRestore)
-        else -> when (vm.screen) {
+        else -> Column(Modifier.fillMaxSize()) {
+            if (banner != null) BackupBanner(banner, !vm.reviewingBackup) { keyboard?.hide(); focus.clearFocus(); vm.reviewBackup() }
+            Box(Modifier.weight(1f).then(if (banner != null) Modifier.consumeWindowInsets(WindowInsets.statusBars) else Modifier)) { when (vm.screen) {
             Screen.LIST -> NotesList(vm)
             Screen.SEARCH -> SearchScreen(vm, back)
             Screen.NOTE -> NoteScreen(vm, back, attach, openFile)
-            Screen.SETTINGS -> SettingsScreen(vm, back, reveal, chooseRestore) { backupPicker.launch("Notes.ssnb") }
+            Screen.SETTINGS -> SettingsScreen(vm, back, reveal, chooseRestore, chooseBackup)
             Screen.IMAGE -> ImageViewer(vm, back)
         }
+            if (vm.reviewingBackup) Box(Modifier.matchParentSize().clickable(interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }, indication = null) {})
+        } }
     }
-    vm.revealedWords?.let { words -> RevealPassphraseDialog(words) { vm.revealedWords = null } }
-    if (vm.replaceBackup != null) AlertDialog(onDismissRequest = { vm.replaceBackup = null }, title = { Text("Replace existing backup?") },
-        text = { Text("This file already contains a Notes backup. If it came from another phone, it may be your only copy of those notes. Restore it instead, or replace it with a backup of the notes on this phone.") },
-        confirmButton = { TextButton(onClick = vm::restoreChosenBackup) { Text("Restore it") } },
-        dismissButton = { Row {
-            TextButton(onClick = { vm.replaceBackup = null }) { Text("Cancel") }
-            TextButton(onClick = vm::confirmReplaceBackup) { Text("Replace", color = MaterialTheme.colorScheme.error) }
-        } })
+    vm.revealedWords?.let { words -> RevealPassphraseDialog(words, { vm.revealedWords = null }, vm::finishPhraseReview) }
+    if (vm.backupProviderWarning != null) AlertDialog(onDismissRequest = vm::cancelBackupSelection,
+        title = { Text(stringResource(R.string.backup_provider_title)) }, text = { Text(stringResource(R.string.backup_provider_warning)) },
+        confirmButton = { TextButton(onClick = vm::acceptBackupProvider) { Text(stringResource(R.string.backup_use_provider)) } },
+        dismissButton = { TextButton(onClick = { vm.launchBackupPicker { backupPicker.launch(null) } }) { Text(stringResource(R.string.backup_choose_again)) } })
     if (vm.share != null && !vm.choosingDestination && vm.setupWords == null) AlertDialog(onDismissRequest = { vm.share = null }, title = { Text("Add shared content") }, text = { Text("Choose where to put the shared text or files.") }, confirmButton = { TextButton(onClick = { vm.acceptShare(null) }) { Text("New note") } }, dismissButton = { TextButton(onClick = { vm.choosingDestination = true; vm.screen = Screen.LIST; vm.query = "" }) { Text("Add to existing note") } })
     if (vm.passwordMode != null) PassphraseDialog(vm.wordlist, "Backup passphrase", "Enter the recovery passphrase of the phone that made this backup. It becomes this phone's recovery passphrase.", "Continue",
         { vm.passwordMode = null }, vm::submitPassword)
-    vm.restoreCount?.let { count -> AlertDialog(onDismissRequest = vm::cancelRestore, title = { Text("Replace all notes?") }, text = { Text("This backup contains $count notes. All current notes, attachments, and settings will be permanently replaced. No safety backup will be created.") }, confirmButton = { TextButton(onClick = vm::restore) { Text("Replace everything") } }, dismissButton = { TextButton(onClick = vm::cancelRestore) { Text("Cancel") } }) }
+    vm.restoreCount?.let { count -> AlertDialog(onDismissRequest = vm::cancelRestore, title = { Text("Replace all notes?") }, text = { Text("This backup contains $count notes, ${vm.backups.pendingCounts?.attachments ?: 0} attachments, and ${vm.backups.pendingCounts?.tags ?: 0} tags. All current notes and attachments will be replaced. The phrase that opened this backup becomes your recovery phrase. This device's backup files and configuration are retained; a different phrase pauses backups until you review it and create a new pair. No safety backup will be created.") }, confirmButton = { TextButton(onClick = vm::restore) { Text("Replace everything") } }, dismissButton = { TextButton(onClick = vm::cancelRestore) { Text("Cancel") } }) }
     vm.busy?.let { message -> AlertDialog(onDismissRequest = {}, title = { Text(message) }, text = { LinearProgressIndicator(Modifier.fillMaxWidth()) }, confirmButton = { TextButton(onClick = vm::cancelOperation) { Text("Cancel") } }) }
     if (vm.cameraRecovery) AlertDialog(onDismissRequest = {}, title = { Text("Unfinished photo") }, text = { Text("A camera capture was interrupted. Keep the photo if it was taken, or discard the capture.") }, confirmButton = { TextButton(onClick = { vm.resolveCamera(true) }) { Text("Keep photo") } }, dismissButton = { TextButton(onClick = { vm.resolveCamera(false) }) { Text("Discard") } })
 }
@@ -555,6 +562,7 @@ private fun annotatedLine(document: Document, start: Int, end: Int, match: dev.s
 
 @Composable private fun SettingsScreen(vm: NotesViewModel, back: () -> Unit, reveal: () -> Unit, restore: () -> Unit, chooseBackup: () -> Unit) {
     val status by vm.app.autoBackup.status.collectAsStateWithLifecycle()
+    val scheduling by vm.app.backupScheduler.state.collectAsStateWithLifecycle()
     val scroll = rememberScrollState()
     Scaffold(topBar = { TopAppBar(title = { Text("Settings") }, navigationIcon = { BackButton(back) }) }) { padding ->
         Column(Modifier.padding(padding).verticalScrollbar(scroll).verticalScroll(scroll).padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -563,20 +571,30 @@ private fun annotatedLine(document: Document, start: Int, end: Int, match: dev.s
             OutlinedButton(onClick = reveal, modifier = Modifier.fillMaxWidth()) { Text("View recovery passphrase") }
             Spacer(Modifier.height(8.dp))
             Text("Automatic backup", style = MaterialTheme.typography.titleLarge)
-            val location = status?.location
-            if (location == null) {
-                Text("Choose a file, for example in Dropbox or Google Drive. Notes keeps it updated with an encrypted copy of all notes and attachments whenever they change.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                FilledTonalButton(onClick = chooseBackup, modifier = Modifier.fillMaxWidth()) { Text("Choose backup file") }
-            } else {
-                Text(location, style = MaterialTheme.typography.titleMedium)
-                Text(status?.savedAt?.let { "Last saved " + java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT).format(java.util.Date(it)) } ?: "Not saved yet", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                status?.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-                FilledTonalButton(onClick = vm::backupNow, modifier = Modifier.fillMaxWidth()) { Text("Back up now") }
-                OutlinedButton(onClick = chooseBackup, modifier = Modifier.fillMaxWidth()) { Text("Change backup file") }
-                TextButton(onClick = vm::turnOffBackup, modifier = Modifier.fillMaxWidth()) { Text("Turn off automatic backup") }
+            val config = status?.configuration
+            val enabled = status != null && status?.restartRequired != true && status?.operation == null && vm.busy == null && !scheduling.mutationsBlocked
+            Text(stringResource(R.string.backup_guidance), color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (config?.mode == BackupMode.PAIR) config.slots.forEach { slot ->
+                Text(if (slot.nameConfirmed) slot.name else stringResource(R.string.backup_unconfirmed_name, slot.name), style = MaterialTheme.typography.titleMedium)
+            } else status?.location?.let { Text(it, style = MaterialTheme.typography.titleMedium) }
+            if (config?.mode == BackupMode.LEGACY) Text(stringResource(R.string.backup_migration), color = MaterialTheme.colorScheme.error)
+            status?.savedAt?.let { saved ->
+                val time = java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT).format(java.util.Date(saved))
+                Text(if (config?.mode == BackupMode.PAIR) "Latest verified: slot ${if (config.active == 0) "A" else "B"} - $time" else "Previously saved: $time")
             }
-            // Dropbox's provider delayed, copied or refused repeated writes to one file, even with unrestricted battery use.
-            Text("Dropbox's app can delay or refuse repeated saves to the same file. For dependable backups, choose a file in phone storage, such as a folder in Downloads, and upload it with a sync app.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (status?.restartRequired == true) Text(stringResource(R.string.backup_restart), color = MaterialTheme.colorScheme.error)
+            status?.error?.let { Text(backupErrorText(it), color = MaterialTheme.colorScheme.error) }
+            status?.setupError?.let { Text(stringResource(R.string.backup_setup_error, backupErrorText(it, setup = true)), color = MaterialTheme.colorScheme.error) }
+            status?.operation?.let { LinearProgressIndicator(Modifier.fillMaxWidth()); Text(stringResource(R.string.backup_working)) }
+            if (config?.pending == true) Text(stringResource(R.string.backup_pending))
+            if (config?.mode == BackupMode.PAIR) {
+                val checkAccess = status?.error?.problem == BackupProblem.ACCESS && status?.grantAvailable != true
+                FilledTonalButton(onClick = if (checkAccess) vm::checkBackupAccess else vm::backupNow,
+                    enabled = enabled && (checkAccess || vm.app.autoBackup.mayWrite(vm.repository.hasPendingEdits(), force = true)),
+                    modifier = Modifier.fillMaxWidth()) { Text(if (checkAccess) stringResource(R.string.backup_check_access) else "Back up now") }
+            }
+            OutlinedButton(onClick = chooseBackup, enabled = enabled, modifier = Modifier.fillMaxWidth()) { Text(if (config?.mode == BackupMode.PAIR) "Create new backup pair" else "Choose backup folder") }
+            if (config != null && config.mode != BackupMode.DISABLED) TextButton(onClick = vm::turnOffBackup, enabled = enabled, modifier = Modifier.fillMaxWidth()) { Text("Turn off automatic backup") }
             OutlinedButton(onClick = restore, modifier = Modifier.fillMaxWidth()) { Text("Restore from backup") }
             Spacer(Modifier.height(16.dp)); Text("${stringResource(R.string.app_name)} · ${dev.securenotes.BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }

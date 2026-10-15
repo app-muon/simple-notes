@@ -18,7 +18,7 @@ Automated tests run against synthetic notes and files. Do not run instrumentatio
 - Debounced/conflated edits, continuous-typing save bounds, device lock with pending saves, encrypted recovery after a failed final database write, and duplicate/stale unlock prevention.
 - Search beyond 10,000 unrelated and matching postings, deep-result scrolling and character highlighting, English accent-aware sorting, and shared text replacing an empty draft body.
 - Camera destination/result recovery across service recreation, idempotent import, EXIF image rotation, and proxy descriptor release.
-- Backup header validation before asking for a password, restore replacement warning/cancellation, and the backup CreateDocument contract/cancellation cleanup. The picker contract test uses a test activity-result registry; real providers still need the checks below.
+- Backup header validation before asking for a password, restore replacement warning/cancellation, and the backup OpenDocumentTree contract/cancellation cleanup. The picker contract test uses a test activity-result registry; real providers still need the checks below.
 
 See generated Gradle reports for the actual run results; passing a compile alone is not a passing instrumented test run.
 
@@ -34,10 +34,28 @@ See generated Gradle reports for the actual run results; passing a compile alone
 - Scroll long notes, note lists, search results, settings, and recovery screens: the scrollbar should track the viewport and disappear when the content fits. On a narrow screen, check the formatting toolbar's horizontal indicator. Verify text selection and note dragging still work beside the indicators.
 - Import photos/files; cancel each picker and the camera. Rotate or recreate the notes activity while the camera is open, and test interrupted-capture recovery after process death. Check portrait photo orientation, image pinch/pan, attachment Move left/right and Remove, duplicate filenames, a large attachment, missing source, unavailable viewer, and return from a viewer after permission revocation.
 - Share text/URL, one image/file, and multiple files from other apps. Confirm cancellation does not create a note and both destinations append content predictably.
-- Choose an automatic backup file in a cloud-backed provider (for example Dropbox). Tap "Back up now" twice; then leave the phone idle for 15 minutes without opening the provider app, edit a note, and leave Notes at once. Confirm within a couple of minutes that the provider shows the same file replaced each time, not a renamed `<name>_<number>` copy, and that Settings shows no error. Dropbox failed this on 9 October 2026 (see [verification](verification.md)); repeated saves to a file in phone storage passed. Reboot and confirm a later edit still updates it. On a fresh install, choose "Restore from backup" and restore using only the 8-word recovery passphrase.
+- Choose a dedicated backup folder in Downloads and verify both A/B files. Test repeated saves, idle-provider behaviour, process interruption and reboot. Verify both files are independently restorable, then verify both external uploads separately. Test another provider explicitly; stale read-back must fail safely.
 - Remove and re-add the device screen lock (invalidating the Keystore key). Confirm the lock screen offers "Unlock with recovery passphrase" and that the passphrase reopens the same notes. Confirm unsupported/corrupt/truncated files leave current notes intact.
 - Interrupt imports/indexing/backup/restore with device lock and process termination. Retry after authentication. Check low-storage behavior using a disposable emulator, not a phone with real notes.
 - Confirm normal Recents and screenshots remain available; inspect release permissions and logs using synthetic sensitive markers.
 - Time search/opening with the intended ten-note/ten-attachment collection. Targets are approximately 200 ms after search debounce and 300 ms to open an ordinary note after authentication.
 
 External file viewers and Android file-provider/camera applications can behave differently between devices. Emulator results do not establish that these physical-device checks passed.
+
+## Verified A/B rollout checks
+
+- From list, search, reading, editing, an image and an empty draft, use Review backup. Confirm pending edits save, failed saves remain editable, successful navigation clears the session, Settings Back returns to the list, and the banner never doubles the status-bar inset.
+- Return a folder before and after resume, rotate during selection, reselect from the provider warning, cancel the picker and lock before its callback. Confirm one setup reservation, no competing automatic save, visible rejection reasons and balanced service holds. Restore and phrase viewing stay available.
+- Finish the activity after setup is accepted, both while queued before resume and during its initial flush. Accepted setup must survive the cleared view model; unsubmitted selection and lock cancellation must retain their existing cleanup.
+- Edit after a running automatic/manual save captures its snapshot, then press Home. Confirm the later edits reach local storage and a follow-up backup under the same uninterrupted service hold. A failure that blocks further backup writes must still allow the pause flush.
+- Remove and restore folder access; eligibility must not call the provider from composition or Main. A late permission refresh in the background must wait for foreground return unless an existing hold covers work.
+- For an active-file access failure, confirm **Check backup access** is enabled, refreshes without a service or write, and changes to **Back up now** when the folder grant is available. An unreadable active file must fail before encryption on repeated retries; a file changed during encryption must still be caught before writing.
+- Exercise absent, blank and failed filename queries. Confirm explicitly unconfirmed requested labels, URI-based identity and cleanup after wrapped security/cancellation failures. Verify older configuration records remain readable.
+- Oversized metadata waits for edits within a process, survives lock/unlock suppression and gets one fresh check after restart even when revision counters coincide. Unreadable active files offer retry/new pair without claiming corruption or a retained verified file.
+- Verify migration preserves the existing single-file backup, name, saved time, and grant until new-pair commit. Confirm old files are never overwritten or automatically deleted.
+- Choose a dedicated Downloads subfolder. Verify both actual names (including collisions), independent A and B restores, alternating active slots, both-file upload-only sync, and grants across reboot.
+- Terminate the process during inactive copying and before final metadata recording. Restart and verify the old active copy, durable pending work, and a successful retry.
+- Test lock during metadata preparation and ciphertext writing; balance service holds on cancellation and timeout.
+- Stage restore, then change/disable the destination before confirming. Confirm latest configuration is transferred. Restore another phrase and verify review plus a new pair is required.
+- Exercise missing phrases, active-file corruption, stale provider read-back, lost grants, full storage, uncertain settings commits, setup cancellation, and same-folder reselection.
+- Record local verification and external upload as separate acceptance results. A local pass never establishes that the sync provider uploaded either file.

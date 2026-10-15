@@ -74,7 +74,7 @@ class MainActivity : FragmentActivity() {
     }
     override fun onResume() {
         super.onResume()
-        app.checkDevice()
+        app.checkDevice(); app.onForeground()
         if (launchedExternal && externalWasPaused) { app.revokeGrants(); launchedExternal = false; externalWasPaused = false }
     }
     override fun onPause() { app.flushEdits(); if (launchedExternal) externalWasPaused = true; super.onPause() }
