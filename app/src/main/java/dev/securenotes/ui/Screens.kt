@@ -610,20 +610,23 @@ private fun annotatedLine(document: Document, start: Int, end: Int, match: dev.s
             } else status?.location?.let { Text(it, style = MaterialTheme.typography.titleMedium) }
             if (config?.mode == BackupMode.LEGACY) Text(stringResource(R.string.backup_migration), color = MaterialTheme.colorScheme.error)
             if (config?.mode == BackupMode.PAIR && config.pairTag == null) Text(stringResource(R.string.backup_whole_files), color = MaterialTheme.colorScheme.onSurfaceVariant)
+            fun time(at: Long) = java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT).format(java.util.Date(at))
             status?.savedAt?.let { saved ->
-                val time = java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT).format(java.util.Date(saved))
-                Text(if (config?.mode == BackupMode.PAIR) "Latest verified: slot ${if (config.active == 0) "A" else "B"} - $time" else "Previously saved: $time")
+                Text(if (config?.mode == BackupMode.PAIR) stringResource(R.string.backup_last_save, if (config.active == 0) "A" else "B", time(saved)) else "Previously saved: ${time(saved)}")
             }
+            if (config?.mode == BackupMode.PAIR) Text(backupCheckSummary(config) { time(it) }, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (status?.restartRequired == true) Text(stringResource(R.string.backup_restart), color = MaterialTheme.colorScheme.error)
             status?.error?.let { Text(backupErrorText(it), color = MaterialTheme.colorScheme.error) }
             status?.setupError?.let { Text(stringResource(R.string.backup_setup_error, backupErrorText(it, setup = true)), color = MaterialTheme.colorScheme.error) }
-            status?.operation?.let { LinearProgressIndicator(Modifier.fillMaxWidth()); Text(stringResource(R.string.backup_working)) }
+            status?.checkError?.let { Text(stringResource(R.string.backup_check_failed, backupCheckErrorText(it)), color = MaterialTheme.colorScheme.error) }
+            status?.operation?.let { LinearProgressIndicator(Modifier.fillMaxWidth()); Text(stringResource(if (it.startsWith("check")) R.string.backup_checking else R.string.backup_working)) }
             if (config?.pending == true) Text(stringResource(R.string.backup_pending))
             if (config?.mode == BackupMode.PAIR) {
                 val checkAccess = status?.error?.problem == BackupProblem.ACCESS && status?.grantAvailable != true
                 FilledTonalButton(onClick = if (checkAccess) vm::checkBackupAccess else vm::backupNow,
                     enabled = enabled && (checkAccess || vm.app.autoBackup.mayWrite(vm.repository.hasPendingEdits(), force = true)),
                     modifier = Modifier.fillMaxWidth()) { Text(if (checkAccess) stringResource(R.string.backup_check_access) else "Back up now") }
+                OutlinedButton(onClick = vm::verifyBackup, enabled = enabled, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.backup_verify)) }
             }
             OutlinedButton(onClick = chooseBackup, enabled = enabled, modifier = Modifier.fillMaxWidth()) { Text(if (config?.mode == BackupMode.PAIR) "Create new backup pair" else "Choose backup folder") }
             if (config != null && config.mode != BackupMode.DISABLED) TextButton(onClick = vm::turnOffBackup, enabled = enabled, modifier = Modifier.fillMaxWidth()) { Text("Turn off automatic backup") }

@@ -138,6 +138,11 @@ class BackupProviderTest {
             // A text edit leaves the attachment file as it was.
             assertEquals(listOf(saved.uri to saved.length), files.children(folder.uri).map { it.uri to it.size })
             assertEquals(saved.digest, files.openRead(saved.uri).use(::ciphertextDigest))
+            // A full check reads both indexes and the attachment through the provider.
+            coordinator.verify()
+            val checked = settings.load()
+            assertTrue(checked.checkIsCurrent); assertEquals(listOf(SlotCheck.VERIFIED, SlotCheck.VERIFIED), checked.check?.slots)
+            assertNull(checked.error); assertNull(coordinator.status.value?.checkError)
             restore(updated.slots[0].uri); source.commit()
             assertEquals("Provider updated", repository.notes.value.single().title)
             // Re-selecting the folder creates a new pair and never deletes the historical pair.

@@ -33,6 +33,22 @@ internal fun backupErrorResource(error: BackupError, setup: Boolean = false): In
 }
 @Composable internal fun backupErrorText(error: BackupError, setup: Boolean = false): String =
     stringResource(backupErrorResource(error, setup)) + if (error.diagnostic.isNotBlank()) " (${error.step}: ${error.diagnostic})" else ""
+/** A full check that could not read every file changed nothing; other reasons read as they do for saves. */
+internal fun backupCheckErrorResource(error: BackupError): Int =
+    if (error.problem == BackupProblem.IO || error.problem == BackupProblem.ACCESS) R.string.backup_check_unverified else backupErrorResource(error)
+@Composable internal fun backupCheckErrorText(error: BackupError): String =
+    stringResource(backupCheckErrorResource(error)) + if (error.diagnostic.isNotBlank()) " (${error.step}: ${error.diagnostic})" else ""
+@Composable internal fun backupCheckSummary(config: BackupConfiguration, time: (Long) -> String): String {
+    val check = config.check ?: return stringResource(R.string.backup_check_none)
+    if (!config.checkIsCurrent) return stringResource(R.string.backup_check_stale, time(check.at))
+    val result = if (check.slots.all { it == SlotCheck.VERIFIED }) stringResource(R.string.backup_check_all)
+    else check.slots.map { state -> stringResource(when (state) {
+        SlotCheck.VERIFIED -> R.string.backup_check_verified
+        SlotCheck.INCOMPLETE -> R.string.backup_check_incomplete
+        SlotCheck.DAMAGED -> R.string.backup_check_damaged
+    }) }.let { (a, b) -> stringResource(R.string.backup_check_slots, a, b) }
+    return stringResource(R.string.backup_check_result, time(check.at), result)
+}
 
 @Composable internal fun backupBannerMessage(status: BackupStatus?): String? = when {
     status == null -> null

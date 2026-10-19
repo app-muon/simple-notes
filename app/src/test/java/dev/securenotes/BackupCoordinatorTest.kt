@@ -42,6 +42,22 @@ class BackupCoordinatorTest {
         val encrypted = mutableListOf<String>()
         /** The attachment filenames each prepared index named. */
         val indexes = mutableListOf<Map<String, String>>()
+        /** What each prepared file contains, so a check authenticates exactly what was written and nothing else. */
+        private val indexContents = mutableMapOf<String, CheckedIndex>()
+        private val attachmentContents = mutableMapOf<String, String>()
+        /** Attachment IDs in the order a full check read their files. */
+        val checked = mutableListOf<String>()
+        var onCheck: suspend (String) -> Unit = {}
+        override suspend fun checkIndex(input: InputStream): CheckedIndex {
+            val index = indexContents[input.readBytes().decodeToString()] ?: throw IOException("authentication failed")
+            return CheckedIndex(index.attachments, index.files, index.key?.copyOf())
+        }
+        override suspend fun checkAttachment(input: InputStream, key: ByteArray, attachment: BackupAttachment) {
+            onCheck(attachment.id)
+            if (attachmentContents[input.readBytes().decodeToString()] != attachment.id) throw IOException("authentication failed")
+            checked += attachment.id
+        }
+        private fun captured() = attachments.map { (id, bytes) -> BackupAttachment(id, bytes.size.toLong(), sha(bytes)) }
         override suspend fun inspect(): BackupInspection {
             inspections++
             failure?.let { throw it }
@@ -55,24 +71,30 @@ class BackupCoordinatorTest {
         override suspend fun prepare(progress: (String) -> Unit): PreparedBackup {
             wholePrepares++
             val content = inspect()
-            return artifact("whole $wholePrepares revision ${content.revision}", content)
+            val text = "whole $wholePrepares revision ${content.revision}"
+            indexContents[text] = CheckedIndex(captured(), null, null)
+            return artifact(text, content)
         }
         override suspend fun capture(progress: (String) -> Unit): BackupSnapshot {
             prepares++; onPrepare()
             val content = inspect()
             afterSnapshot(content)
-            return BackupSnapshot(content, attachments.map { (id, bytes) -> BackupAttachment(id, bytes.size.toLong(), sha(bytes)) })
+            return BackupSnapshot(content, captured())
         }
         override suspend fun prepareAttachment(snapshot: BackupSnapshot, attachment: BackupAttachment, key: ByteArray): PreparedBackup {
             onAttachment(attachment.id)
             val bytes = attachments[attachment.id]?.takeIf { sha(it) == attachment.sha256 } ?: throw SnapshotChanged()
             encrypted += attachment.id
             // Each encryption differs, as Tink's fresh randomness makes it.
-            return artifact("attachment ${attachment.id} ${encrypted.size} ${bytes.decodeToString()}", snapshot.content)
+            val text = "attachment ${attachment.id} ${encrypted.size} ${bytes.decodeToString()}"
+            attachmentContents[text] = attachment.id
+            return artifact(text, snapshot.content)
         }
         override suspend fun prepareIndex(snapshot: BackupSnapshot, key: ByteArray, folder: String?, files: Map<String, String>): PreparedBackup {
             indexes += files
-            return artifact("ciphertext $prepares folder $folder files $files revision ${snapshot.content.revision}", snapshot.content)
+            val text = "ciphertext $prepares folder $folder files $files revision ${snapshot.content.revision}"
+            indexContents[text] = CheckedIndex(snapshot.attachments, files, key.copyOf())
+            return artifact(text, snapshot.content)
         }
     }
     private class FakeSettings(val unlocked: () -> Boolean) : BackupSettingsStore {
@@ -138,6 +160,9 @@ class BackupCoordinatorTest {
         val listedSizes = mutableMapOf<String, Long?>()
         val measuredSizes = mutableMapOf<String, Long?>()
         var measureFailure: Exception? = null
+        /** Documents that open but fail partway through reading, and listed documents that report not found on opening. */
+        val unreadable = mutableSetOf<String>()
+        val unopenable = mutableSetOf<String>()
         private val names = mutableMapOf<String, String>()
         override fun hasGrant(folder: String): Boolean { grantChecks++; onGrant(); return folder in grants }
         override fun retain(folder: String) { grants += folder; events += "retain:$folder" }
@@ -177,7 +202,12 @@ class BackupCoordinatorTest {
             events += "read:$uri"
             readFailure?.let { throw it }
             if (failure == "read" || failure == "read:$uri") throw IOException()
-            return (data[uri] ?: throw FileNotFoundException()).inputStream()
+            if (uri in unopenable) throw FileNotFoundException()
+            val bytes = data[uri] ?: throw FileNotFoundException()
+            if (uri in unreadable) return object : InputStream() {
+                override fun read(): Int = throw IOException("provider")
+            }
+            return bytes.inputStream()
         }
         override fun openWrite(uri: String, mode: String): BackupOutput {
             events += "open:$uri:$mode"
@@ -968,6 +998,101 @@ class BackupCoordinatorTest {
         assertThrows(IllegalArgumentException::class.java) { decoded.copy(attachmentFolder = BackupFolder("f", "F")).validate() }
         assertThrows(IllegalArgumentException::class.java) { decoded.copy(pairTag = "not a uuid").validate() }
         assertThrows(IllegalArgumentException::class.java) { BackupConfiguration(pairTag = id(1)).validate() }
+    }
+
+    @Test fun `a full check reads both indexes and each shared attachment once and records the digests it read`() = runTest {
+        val f = fixture(); f.source.attachments[id(1)] = "first".toByteArray(); f.source.attachments[id(2)] = "second".toByteArray(); f.setup()
+        // A and B now differ, and both name the same attachment files.
+        f.source.revision++; f.backup.run(); f.files.events.clear()
+        f.backup.verify()
+        val check = checkNotNull(f.settings.record.check)
+        assertEquals(listOf(SlotCheck.VERIFIED, SlotCheck.VERIFIED), check.slots)
+        assertEquals(123456789L, check.at); assertTrue(f.settings.record.checkIsCurrent)
+        assertEquals(listOf(id(1), id(2)), f.source.checked)
+        assertTrue(f.files.events.none { it.startsWith("open:") || it.startsWith("delete:") || it.startsWith("mkdir:") })
+        assertNull(f.backup.status.value!!.checkError); assertNull(f.settings.record.error)
+        // A later save makes the result history without discarding it.
+        f.source.revision++; f.backup.run()
+        assertFalse(f.settings.record.checkIsCurrent); assertEquals(check, f.settings.record.check)
+        // Whole-file pairs are checked from their own contents.
+        f.settings.record = f.settings.record.copy(pairTag = null, attachmentFolder = null, check = null)
+        f.restart(); f.source.revision++; f.backup.run(); f.backup.run(force = true)
+        f.source.checked.clear(); f.backup.verify()
+        assertEquals(listOf(SlotCheck.VERIFIED, SlotCheck.VERIFIED), f.settings.record.check?.slots); assertTrue(f.source.checked.isEmpty())
+    }
+    @Test fun `corruption found by a full check pauses the pair`() = runTest {
+        for (target in listOf("attachment", "active index")) {
+            val f = fixture(); f.source.attachments[id(1)] = "first".toByteArray(); f.setup()
+            if (target == "attachment") {
+                val file = f.saved().getValue(id(1))
+                f.files.data[file.uri] = f.files.data.getValue(file.uri).let { it.copyOf().also { bytes -> bytes[bytes.lastIndex] = (bytes.last() + 1).toByte() } }
+                // The same size: routine saves deliberately do not notice.
+                f.source.revision++; f.backup.run(); assertNull(target, f.settings.record.error)
+            } else f.files.data[f.settings.record.slots[f.settings.record.active].uri] = "other".toByteArray()
+            f.files.events.clear(); f.backup.verify()
+            val expected = if (target == "attachment") BackupProblem.ATTACHMENT_DAMAGED else BackupProblem.ACTIVE_DAMAGED
+            assertEquals(target, expected, f.settings.record.error?.problem)
+            assertNull(target, f.settings.record.check); assertNull(target, f.backup.status.value!!.checkError)
+            assertFalse(target, f.backup.mayWrite(force = true)); assertTrue(target, f.files.events.none { it.startsWith("open:") })
+        }
+        // Missing, when the folder's listing agrees.
+        val f = fixture(); f.source.attachments[id(1)] = "first".toByteArray(); f.setup()
+        f.files.data.remove(f.saved().getValue(id(1)).uri); f.backup.verify()
+        assertEquals(BackupProblem.ATTACHMENT_DAMAGED, f.settings.record.error?.problem)
+    }
+    @Test fun `a full check that cannot read every file changes nothing`() = runTest {
+        val cases = listOf<Pair<String, (Fixture) -> Unit>>(
+            "attachment read fails" to { f -> f.files.unreadable += f.saved().getValue(id(1)).uri },
+            "index read fails" to { f -> f.files.unreadable += f.settings.record.slots[0].uri },
+            "listed attachment not found" to { f -> f.files.unopenable += f.saved().getValue(id(1)).uri },
+            "access denied" to { f -> f.files.readFailure = IOException("private", SecurityException()) },
+            "phrase changed" to { f -> f.source.phrase = "b".repeat(64) },
+        )
+        for ((name, arrange) in cases) {
+            val f = fixture(); f.source.attachments[id(1)] = "first".toByteArray(); f.setup()
+            val before = f.settings.record
+            arrange(f); f.backup.verify()
+            assertEquals(name, before, f.settings.record)
+            assertNotNull(name, f.backup.status.value!!.checkError)
+            if (name != "phrase changed") assertTrue(name, f.backup.mayWrite(force = true))
+        }
+        assertEquals(R.string.backup_check_unverified, dev.securenotes.ui.backupCheckErrorResource(BackupError(BackupProblem.IO, "attachments")))
+        assertEquals(R.string.backup_check_unverified, dev.securenotes.ui.backupCheckErrorResource(BackupError(BackupProblem.ACCESS, "index-A")))
+        assertEquals(R.string.backup_phrase_changed, dev.securenotes.ui.backupCheckErrorResource(BackupError(BackupProblem.PHRASE_CHANGED, "check")))
+    }
+    @Test fun `an interrupted or damaged inactive index is reported without pausing the pair`() = runTest {
+        val f = fixture(); f.source.attachments[id(1)] = "first".toByteArray(); f.setup()
+        f.files.failure = "write"; f.source.revision++; f.backup.run(); f.files.failure = null
+        assertTrue(f.settings.record.pending)
+        val active = f.settings.record.active
+        f.backup.verify()
+        assertEquals(SlotCheck.VERIFIED, f.settings.record.check!!.slots[active]); assertEquals(SlotCheck.INCOMPLETE, f.settings.record.check!!.slots[1 - active])
+        assertEquals(BackupProblem.IO, f.settings.record.error?.problem); assertTrue(f.backup.mayWrite())
+        f.backup.run(); assertFalse(f.settings.record.pending); assertNull(f.settings.record.error)
+        val inactive = f.settings.record.slots[1 - f.settings.record.active].uri
+        f.files.data[inactive] = "junk".toByteArray(); f.backup.verify()
+        assertEquals(SlotCheck.DAMAGED, f.settings.record.check!!.slots[1 - f.settings.record.active])
+        assertNull(f.settings.record.error); assertTrue(f.backup.mayWrite(force = true))
+    }
+    @Test fun `a full check that does not finish records nothing`() = runTest {
+        val f = fixture(); f.source.attachments[id(1)] = "first".toByteArray(); f.setup(); val before = f.settings.record
+        f.source.onCheck = { f.unlocked = false; throw CancellationException() }
+        try { f.backup.verify(); fail("Expected cancellation") } catch (_: CancellationException) { }
+        assertEquals(before, f.settings.record)
+    }
+    @Test fun `leaving the app cancels a full check and still saves under a service hold`() = runTest {
+        val f = fixture(); f.source.attachments[id(1)] = "first".toByteArray(); f.setup(); val s = Scheduling(backgroundScope, f)
+        assertEquals(BackupAdmission.BUSY, s.scheduler.verify().admission)
+        s.scheduler.onForeground(); runCurrent()
+        val reading = CompletableDeferred<Unit>(); var cancelled = false
+        f.source.onCheck = { reading.complete(Unit); try { awaitCancellation() } catch (e: CancellationException) { cancelled = true; throw e } }
+        assertTrue(s.scheduler.verify().admission.accepted); reading.await()
+        assertEquals(0, s.holds); assertTrue(s.scheduler.state.value.mutationsBlocked)
+        f.source.revision++; s.scheduler.onLeaving(); runCurrent()
+        assertTrue(cancelled); assertNull(f.settings.record.check)
+        assertEquals(1, s.acquisitions); assertEquals(0, s.holds); assertEquals(1, s.flushes)
+        assertTrue(f.files.data.getValue(f.settings.record.slots[f.settings.record.active].uri).decodeToString().endsWith("revision ${f.source.revision}"))
+        assertFalse(s.scheduler.state.value.mutationsBlocked)
     }
 }
 

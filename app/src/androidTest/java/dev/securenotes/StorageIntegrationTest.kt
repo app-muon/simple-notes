@@ -555,6 +555,30 @@ class StorageIntegrationTest {
         assertEquals(1, backup.stage(index(key, extra = false), phrase.toCharArray()) {}); backup.commit()
         assertEquals(note, repository.notes.value.single())
     }
+    private suspend fun fails(block: suspend () -> Unit) { try { block(); fail("Expected the check to fail") } catch (_: Exception) { } }
+    @Test fun fullChecksAuthenticateIndexesAndAttachmentFilesWithoutStaging() = runBlocking {
+        val note = repository.import(Note(title = "Checked"), source("a.txt", "first".toByteArray()))
+        val (index, root) = incrementalBackup()
+        val checked = context.contentResolver.openInputStream(index)!!.use { backup.checkIndex(it) }
+        val attachment = checked.attachments.single()
+        val key = checkNotNull(checked.key)
+        val file = File(File(root, "Notes-attachments"), checked.files!!.getValue(attachment.id))
+        file.inputStream().use { backup.checkAttachment(it, key, attachment) }
+        // A changed byte, a truncation or another identity all fail.
+        val bytes = file.readBytes()
+        fails { backup.checkAttachment(bytes.copyOf().also { it[it.size / 2] = (it[it.size / 2] + 1).toByte() }.inputStream(), key, attachment) }
+        fails { backup.checkAttachment(bytes.copyOf(bytes.size - 1).inputStream(), key, attachment) }
+        fails { backup.checkAttachment(bytes.inputStream(), key, attachment.copy(sha256 = "0".repeat(64))) }
+        fails { backup.checkAttachment(bytes.inputStream(), key, attachment.copy(id = newId())) }
+        // Whole files are checked with the attachments they contain.
+        val whole = backup.create({})!!.first; sources += whole
+        val wholeCheck = whole.inputStream().use { backup.checkIndex(it) }
+        assertEquals(listOf(attachment), wholeCheck.attachments); assertNull(wholeCheck.files); assertNull(wholeCheck.key)
+        fails { backup.checkIndex(whole.readBytes().also { it[it.size - 40] = (it[it.size - 40] + 1).toByte() }.inputStream()) }
+        // Nothing was staged or replaced.
+        assertNull(backup.pending); assertFalse(backup.awaitingFolder); assertEquals(note, repository.notes.value.single())
+        key.fill(0)
+    }
     @Test fun restorePublicationCarriesThePairKeyAndAttachmentRecordsOnly() = runBlocking {
         repository.save(Note(title = "Restored"))
         val file = backup.create({})!!.first; sources += file

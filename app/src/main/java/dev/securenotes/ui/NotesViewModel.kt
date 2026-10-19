@@ -445,6 +445,7 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     }
     fun checkBackupAccess() { if (canChooseBackup()) app.backupScheduler.refreshAccess() }
     fun backupNow() { if (canChooseBackup()) app.backupScheduler.manual() }
+    fun verifyBackup() { if (canChooseBackup()) app.backupScheduler.verify() }
     fun turnOffBackup() { if (canChooseBackup()) app.backupScheduler.disable() }
     fun restore() {
         restoreCount = null

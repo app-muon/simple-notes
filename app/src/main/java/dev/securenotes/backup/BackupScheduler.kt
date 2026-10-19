@@ -32,6 +32,7 @@ class BackupScheduler(
     private var automatic: Job? = null
     private var explicit: Job? = null
     private var leavingFlush: Job? = null
+    private var checking: Job? = null
     private val operations = mutableSetOf<Job>()
     private val releases = mutableMapOf<Job, () -> Unit>()
     private val holdEligible = mutableSetOf<Job>()
@@ -59,6 +60,9 @@ class BackupScheduler(
         drainDeferred()
     }
     fun onLeaving() {
+        // A full check runs only while visible. Its cancellation finishes inside the coordinator lock, which the leaving
+        // save then waits for, so it is no longer the explicit operation that would defer that save.
+        checking?.let { check -> check.cancel(); checking = null; if (explicit === check) explicit = null }
         if (unlocked()) {
             if (reservation != null || explicit != null) {
                 deferredAutomatic = true
@@ -108,6 +112,7 @@ class BackupScheduler(
             if (automatic === job) automatic = null
             if (explicit === job) explicit = null
             if (leavingFlush === job) leavingFlush = null
+            if (checking === job) checking = null
             completed(); publish(); drainDeferred()
         }
         publish(); job.start()
@@ -170,6 +175,13 @@ class BackupScheduler(
         return BackupRequest(BackupAdmission.ACCEPTED, launchOwned(true, register = { explicit = it }) {
             runAttempts(force = true, progress = progress)
         })
+    }
+    /** Reads and checks every file of the pair, without a service hold: leaving the app cancels it. */
+    fun verify(progress: (String) -> Unit = {}): BackupRequest {
+        val admission = admission()
+        if (!admission.accepted) return BackupRequest(admission)
+        if (!visible) return BackupRequest(BackupAdmission.BUSY)
+        return BackupRequest(BackupAdmission.ACCEPTED, launchOwned(false, register = { explicit = it; checking = it }) { backup.verify(progress) })
     }
     /** Refresh permission eligibility without starting a service or retrying storage implicitly. */
     fun refreshAccess(): BackupRequest {

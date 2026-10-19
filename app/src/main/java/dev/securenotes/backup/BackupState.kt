@@ -11,6 +11,9 @@ import java.security.MessageDigest
 @Serializable enum class BackupProblem { IO, ACCESS, MANIFEST_TOO_LARGE, PHRASE_MISSING, PHRASE_CHANGED, ACTIVE_DAMAGED, INVALID_CONFIGURATION, BUSY, RESTART_REQUIRED, SELECT_AGAIN, ATTACHMENT_DAMAGED }
 @Serializable data class BackupError(val problem: BackupProblem, val step: String, val diagnostic: String = "", val revision: Long? = null)
 @Serializable data class BackupSlot(val uri: String, val name: String, val length: Long, val sha256: String, val nameConfirmed: Boolean = true)
+@Serializable enum class SlotCheck { VERIFIED, INCOMPLETE, DAMAGED }
+/** A completed full check, tied to the exact index digests it read; a later save makes it history. */
+@Serializable data class FullCheck(val at: Long, val digests: List<String>, val slots: List<SlotCheck>)
 /** A pair's attachment directory, created when its first attachment is saved. Its name is always provider-confirmed. */
 @Serializable data class BackupFolder(val uri: String, val name: String)
 /**
@@ -46,12 +49,13 @@ enum class BackupAdmission {
     /** Keys the pair's attachment key and file records in device settings. */
     val pairTag: String? = null,
     val attachmentFolder: BackupFolder? = null,
+    val check: FullCheck? = null,
 ) {
     fun validate() {
         require(version in 1..2)
         when (mode) {
-            BackupMode.DISABLED -> require(slots.isEmpty() && folder == null && legacyUri == null && pairTag == null && attachmentFolder == null)
-            BackupMode.LEGACY -> require(!legacyUri.isNullOrBlank() && slots.isEmpty() && pairTag == null && attachmentFolder == null)
+            BackupMode.DISABLED -> require(slots.isEmpty() && folder == null && legacyUri == null && pairTag == null && attachmentFolder == null && check == null)
+            BackupMode.LEGACY -> require(!legacyUri.isNullOrBlank() && slots.isEmpty() && pairTag == null && attachmentFolder == null && check == null)
             BackupMode.PAIR -> {
                 require(!folder.isNullOrBlank() && slots.size == 2 && active in 0..1)
                 require(slots.map { it.uri }.distinct().size == 2)
@@ -59,9 +63,12 @@ enum class BackupAdmission {
                 require(validDigest(phraseHash) && validDigest(fingerprint))
                 pairTag?.let { require(dev.securenotes.document.validId(it)) }
                 attachmentFolder?.let { require(pairTag != null && it.uri.isNotBlank() && it.name.isNotBlank() && slots.none { slot -> slot.uri == it.uri }) }
+                check?.let { require(it.digests.size == 2 && it.digests.all(::validDigest) && it.slots.size == 2) }
             }
         }
     }
+    /** The last full check read exactly the files that are recorded now. */
+    val checkIsCurrent: Boolean get() = check != null && check.digests == slots.map { it.sha256 }
     val grant: String? get() = if (mode == BackupMode.LEGACY) legacyUri else folder
     val managedUris: Set<String> get() = slots.map { it.uri }.toSet() + listOfNotNull(legacyUri, attachmentFolder?.uri)
     fun afterRestore(restoredPhraseHash: String): BackupConfiguration {
@@ -78,6 +85,8 @@ data class BackupStatus(
     val setupError: BackupError? = null,
     val restartRequired: Boolean = false,
     val grantAvailable: Boolean? = null,
+    /** Why the last full check could not finish; it changed nothing. */
+    val checkError: BackupError? = null,
 ) {
     val location: String? get() = when (configuration.mode) {
         BackupMode.DISABLED -> null
@@ -106,7 +115,13 @@ interface BackupSource {
     suspend fun prepareAttachment(snapshot: BackupSnapshot, attachment: BackupAttachment, key: ByteArray): PreparedBackup
     /** A version-4 index naming [files] (attachment ID to actual filename) in [folder]. */
     suspend fun prepareIndex(snapshot: BackupSnapshot, key: ByteArray, folder: String?, files: Map<String, String>): PreparedBackup
+    /** Authenticates and validates a backup file with this vault's phrase, checking any attachments it contains. */
+    suspend fun checkIndex(input: InputStream): CheckedIndex
+    /** Authenticates one attachment file and checks its plaintext length and SHA-256, discarding the plaintext. */
+    suspend fun checkAttachment(input: InputStream, key: ByteArray, attachment: BackupAttachment)
 }
+/** What a checked backup file names: for a version-4 index, its separate attachment files and their key. */
+class CheckedIndex(val attachments: List<BackupAttachment>, val files: Map<String, String>?, val key: ByteArray?)
 interface BackupSettingsStore {
     suspend fun load(): BackupConfiguration
     /** Call [beginWrite] after session/access checks, immediately before the atomic write. */

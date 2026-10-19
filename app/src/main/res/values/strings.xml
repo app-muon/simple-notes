@@ -1,10 +1,23 @@
 <resources>
     <string name="app_name">Notes</string>
-    <string name="backup_guidance">Choose a dedicated phone-storage subfolder, for example NotesBackups in Downloads. Notes alternates between two encrypted backup files and verifies each save locally. New pairs save each attachment once, in an attachments folder beside the two files; routine saves don\'t re-read attachments saved earlier. Sync the whole folder, including subfolders, in upload-only mode. Local verification does not confirm an external upload.</string>
+    <string name="backup_guidance">Choose a dedicated phone-storage subfolder, for example NotesBackups in Downloads. Notes alternates between two encrypted backup files and verifies each save locally. New pairs save each attachment once, in an attachments folder beside the two files; routine saves don\'t re-read attachments saved earlier, so use Verify backup now and then. Sync the whole folder, including subfolders, in upload-only mode. Local verification does not confirm an external upload.</string>
     <string name="backup_whole_files">This pair saves every attachment again in each backup file. Create a new backup pair to save each attachment only once. The current files are kept.</string>
     <string name="backup_attachments_unverified">The backup\'s attachment files could not be checked, so their condition is unverified. No backup file was overwritten. Check access and retry with Back up now, or create a new pair if files are missing.</string>
     <string name="backup_attachments_access">The backup\'s attachment folder could not be accessed, so its files could not be checked. No backup file was overwritten. Check backup access in Settings and retry when access is available.</string>
-    <string name="backup_attachment_damaged">An attachment file of this backup pair is missing or has changed size. No backup file was overwritten. Create a new pair and keep the old files for recovery.</string>
+    <string name="backup_attachment_damaged">An attachment file of this backup pair is missing or damaged. No backup file was overwritten. Create a new pair and keep the old files for recovery.</string>
+    <string name="backup_last_save">Last save: slot %1$s, %2$s</string>
+    <string name="backup_verify">Verify backup</string>
+    <string name="backup_checking">Reading and checking every backup file…</string>
+    <string name="backup_check_none">Not fully checked yet. Verify backup reads both files and every attachment.</string>
+    <string name="backup_check_stale">Last full check: %1$s, before the latest save. Verify backup again to check the current files.</string>
+    <string name="backup_check_result">Last full check: %1$s. %2$s</string>
+    <string name="backup_check_all">Both files and all their attachments verified.</string>
+    <string name="backup_check_slots">Slot A: %1$s. Slot B: %2$s. Every attachment they name verified.</string>
+    <string name="backup_check_verified">verified</string>
+    <string name="backup_check_incomplete">incomplete, from an interrupted save that the next save replaces</string>
+    <string name="backup_check_damaged">damaged; the next save replaces it</string>
+    <string name="backup_check_unverified">The full check could not read every file, so the backup is unverified. Nothing was changed. Check access, let syncing finish and try again.</string>
+    <string name="backup_check_failed">Full check: %1$s</string>
     <string name="backup_attachment_conflict">An attachment no longer matches the copy saved in this backup pair, for example after restoring a different backup. Create a new pair; the old files are kept.</string>
     <string name="restore_folder_title">Choose the attachments folder</string>
     <string name="restore_folder">This backup keeps its attachments in a separate folder, %1$s, beside the backup file. Choose that folder or the folder that contains it, even if it was moved or renamed. Check that all of its files have finished syncing.</string>

@@ -113,6 +113,47 @@ class BackupService(private val context: Context, private val repository: NotesR
         val bytes = indexBytes(snapshot.manifest as BackupManifest, key, folder, files, snapshot.content.revision)
         encrypt(v, bytes, emptyList(), phrase, snapshot.content) {}
     }
+    // Only the phrase needs the vault; reading never holds the repository mutex, so edits keep saving meanwhile.
+    override suspend fun checkIndex(input: InputStream): CheckedIndex {
+        val phrase = repository.access { it.passphrase() }?.let(Passphrase::normalize)?.takeIf { it.isNotBlank() } ?: throw BackupFailure(BackupProblem.PHRASE_MISSING)
+        val password = phrase.toCharArray()
+        try {
+            return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                val operation = currentCoroutineContext()
+                val data = BackupCodec.decrypt(input.buffered(), password) { clear ->
+                    val zip = ZipInputStream(clear)
+                    require(zip.nextEntry?.name == "manifest.json") { "Missing manifest" }
+                    val data = documentJson.decodeFromString<BackupManifest>(readBounded(zip, MANIFEST_LIMIT).toString(Charsets.UTF_8))
+                    validate(data)
+                    if (data.version == 4) require(zip.nextEntry == null) { "Unexpected archive entry" }
+                    else {
+                        val expected = data.attachments.associateBy { it.id }
+                        val seen = mutableSetOf<String>()
+                        while (true) {
+                            val entry = zip.nextEntry ?: break
+                            require(entry.name.startsWith("attachments/")) { "Unexpected archive entry" }
+                            val attachment = expected[entry.name.removePrefix("attachments/")] ?: error("Unexpected attachment")
+                            require(seen.add(attachment.id)) { "Duplicate attachment" }
+                            val (size, hash) = measure(zip, attachment.size) { checkAccess(); operation.ensureActive() }
+                            require(size == attachment.size && hash == attachment.sha256) { "Attachment integrity failure" }
+                        }
+                        require(seen == expected.keys) { "Missing attachments" }
+                    }
+                    data
+                }
+                // Parsed only after the whole file has been authenticated.
+                CheckedIndex(data.attachments.map { BackupAttachment(it.id, it.size, it.sha256) }, data.attachmentFiles,
+                    if (data.version == 4) BackupCodec.decodeKey(checkNotNull(data.attachmentKey)) else null)
+            }
+        } finally { password.fill('\u0000') }
+    }
+    override suspend fun checkAttachment(input: InputStream, key: ByteArray, attachment: BackupAttachment) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        val operation = currentCoroutineContext()
+        AttachmentCodec.decrypt(input.buffered(), key, attachment.id) { clear ->
+            val (size, hash) = measure(clear, attachment.size) { checkAccess(); operation.ensureActive() }
+            require(size == attachment.size && hash == attachment.sha256) { "Attachment integrity failure" }
+        }
+    }
     /** Test fixtures deliberately bypass phrase confirmation; production [prepare] always requires it. */
     @VisibleForTesting
     internal suspend fun create(progress: (String) -> Unit, unchangedSince: String? = null): Pair<File, String>? = repository.access { v ->
@@ -278,6 +319,22 @@ class BackupService(private val context: Context, private val repository: NotesR
             val buffer = ByteArray(8192)
             while (true) { val count = input.read(buffer); if (count < 0) break; require(out.size() + count <= limit) { "Manifest too large" }; out.write(buffer, 0, count) }
             return out.toByteArray()
+        }
+        /** Length and SHA-256 of [input] read to its end, failing once it exceeds [maxBytes]. */
+        fun measure(input: InputStream, maxBytes: Long, checkpoint: () -> Unit = {}): Pair<Long, String> {
+            val digest = MessageDigest.getInstance("SHA-256")
+            val buffer = ByteArray(64 * 1024)
+            var size = 0L
+            try {
+                while (true) {
+                    checkpoint()
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    require(count.toLong() <= maxBytes - size) { "Attachment length mismatch" }
+                    digest.update(buffer, 0, count); size += count
+                }
+            } finally { buffer.fill(0) }
+            return size to digest.digest().hex()
         }
         /** A single path component a provider can show; names of one manifest must not collide ignoring case. */
         fun safeName(name: String) = name.isNotBlank() && name.length <= 255 && name != "." && name != ".." && name.none { it == '/' || it == '\\' || it == '\u0000' }

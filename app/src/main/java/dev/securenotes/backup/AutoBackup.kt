@@ -8,6 +8,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.FileNotFoundException
+import java.io.FilterInputStream
+import java.io.InputStream
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
@@ -37,6 +39,7 @@ class AutoBackup(
     // Revisions are process-local counters. Never trust a revision decoded from a previous process.
     @Volatile private var oversizedRevision: Long? = null
     @Volatile private var grantAvailable: Boolean? = null
+    @Volatile private var checkError: BackupError? = null
     val busy: Boolean get() = mutex.isLocked
     fun admission(): BackupAdmission = when {
         !unlocked() -> BackupAdmission.LOCKED
@@ -57,9 +60,9 @@ class AutoBackup(
     }
     fun clearSetupError() { setupError = null; publish() }
     fun setupFlushFailed() { setupError = BackupError(BackupProblem.IO, "flush"); publish() }
-    @Synchronized fun clearStatus() { visible = false; reviewedPhrase = null; mutableStatus.value = null }
+    @Synchronized fun clearStatus() { visible = false; reviewedPhrase = null; checkError = null; mutableStatus.value = null }
     @Synchronized private fun publish() {
-        mutableStatus.value = if (visible && unlocked()) BackupStatus(trusted ?: BackupConfiguration(), operation, transientError ?: trusted?.error, setupError, restartRequired, grantAvailable) else null
+        mutableStatus.value = if (visible && unlocked()) BackupStatus(trusted ?: BackupConfiguration(), operation, transientError ?: trusted?.error, setupError, restartRequired, grantAvailable, checkError) else null
     }
     suspend fun refresh() = mutex.withLock {
         visible = unlocked()
@@ -313,6 +316,92 @@ class AutoBackup(
         }
     }
 
+    /**
+     * Reads both indexes and every attachment they name with restore's checks, discarding the plaintext. Confirmed
+     * corruption of the active index or of an attachment pauses writes to the pair; a damaged or interrupted inactive
+     * index is only reported. Read and access failures change nothing, and a check that does not finish records nothing.
+     */
+    suspend fun verify(progress: (String) -> Unit = {}) = mutex.withLock {
+        val config = trusted ?: return@withLock
+        if (!unlocked() || restartRequired || config.mode != BackupMode.PAIR) return@withLock
+        var step = "check"
+        fun report(value: String) { step = value; operation = "check-$value"; publish() }
+        operation = "check"; checkError = null; publish()
+        val indexes = mutableListOf<CheckedIndex>()
+        try {
+            config.validate()
+            requireGrant(checkNotNull(config.folder))
+            if (source.inspect().phraseHash != config.phraseHash) throw BackupFailure(BackupProblem.PHRASE_CHANGED)
+            val states = MutableList(2) { SlotCheck.VERIFIED }
+            for (slot in listOf(config.active, 1 - config.active)) {
+                report("index-${"AB"[slot]}")
+                val index = checkIndexFile(config.slots[slot])
+                when {
+                    index != null -> indexes += index
+                    slot == config.active -> throw BackupFailure(BackupProblem.ACTIVE_DAMAGED)
+                    else -> states[slot] = if (config.pending) SlotCheck.INCOMPLETE else SlotCheck.DAMAGED
+                }
+            }
+            checkAttachmentFiles(config, indexes, progress, ::report)
+            report("record")
+            persist(checkNotNull(trusted).copy(check = FullCheck(clock(), config.slots.map { it.sha256 }, states)))
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) {
+            val failure = error(e, step)
+            if (failure.problem in setOf(BackupProblem.ACTIVE_DAMAGED, BackupProblem.ATTACHMENT_DAMAGED) && !restartRequired) {
+                transientError = failure
+                try { persist(checkNotNull(trusted).copy(error = failure)) }
+                catch (_: CancellationException) { /* Pausing is retried by the next check. */ }
+                catch (_: Exception) { /* persist set the restart block. */ }
+            } else checkError = failure
+        } finally {
+            indexes.forEach { it.key?.fill(0) }
+            operation = null; publish()
+        }
+    }
+    /** Null when the index's content is not the recorded file or fails authentication. */
+    private suspend fun checkIndexFile(slot: BackupSlot): CheckedIndex? {
+        try { withContext(io) { files.verify(slot) } } catch (_: BackupFailure) { return null }
+        return readChecked(slot.uri) { source.checkIndex(it) }
+    }
+    /** Each attachment named by either index is read once; both must name it identically, under the same key. */
+    private suspend fun checkAttachmentFiles(config: BackupConfiguration, indexes: List<CheckedIndex>, progress: (String) -> Unit, report: (String) -> Unit) {
+        val named = linkedMapOf<String, Triple<BackupAttachment, String, ByteArray>>()
+        for (index in indexes) {
+            val names = index.files ?: continue
+            val key = checkNotNull(index.key)
+            for (attachment in index.attachments) {
+                val seen = named.getOrPut(attachment.id) { Triple(attachment, names.getValue(attachment.id), key) }
+                if (seen.first != attachment || seen.second != names[attachment.id] || !seen.third.contentEquals(key)) {
+                    report("attachments"); throw BackupFailure(BackupProblem.ATTACHMENT_DAMAGED)
+                }
+            }
+        }
+        if (named.isEmpty()) return
+        report("attachments")
+        val directory = config.attachmentFolder ?: throw BackupFailure(BackupProblem.ATTACHMENT_DAMAGED)
+        val recorded = settings.files(checkNotNull(config.pairTag))
+        named.values.forEachIndexed { index, (attachment, name, key) ->
+            progress("Checking attachment ${index + 1} of ${named.size}")
+            val file = recorded[attachment.id]?.takeIf { it.complete && it.name == name && it.size == attachment.size && it.sha256 == attachment.sha256 }
+                ?: throw BackupFailure(BackupProblem.ATTACHMENT_DAMAGED)
+            val intact = try { readChecked(file.uri) { source.checkAttachment(it, key, attachment); true } ?: false }
+            catch (e: FileNotFoundException) {
+                // Missing only if the folder's listing agrees; otherwise unverified.
+                if (withContext(io) { files.children(directory.uri) }.any { it.uri == file.uri }) throw e
+                false
+            }
+            if (!intact) throw BackupFailure(BackupProblem.ATTACHMENT_DAMAGED)
+        }
+    }
+    /** Null when the document was read in full but its content failed a check; read and access failures propagate. */
+    private suspend fun <T : Any> readChecked(uri: String, check: suspend (InputStream) -> T): T? {
+        val input = withContext(io) { Tracked(files.openRead(uri)) }
+        return try { input.use { check(it) } }
+        catch (e: CancellationException) { throw e }
+        catch (e: Exception) { if (input.failed || e.hasSecurityCause() || e is BackupFailure) throw e else null }
+    }
+
     /** Reject delayed picker callbacks when busy. Never adopt a document by name. */
     suspend fun choose(folder: String, progress: (String) -> Unit = {}): BackupAdmission {
         val admission = admission()
@@ -423,4 +512,13 @@ class AutoBackup(
             throw e
         } finally { operation = null; publish() }
     }
+}
+
+/** Remembers whether reading the document itself failed, which tells an unreadable file apart from damaged content. */
+private class Tracked(input: InputStream) : FilterInputStream(input) {
+    var failed = false
+        private set
+    override fun read(): Int = try { `in`.read() } catch (e: Exception) { failed = true; throw e }
+    override fun read(bytes: ByteArray, offset: Int, length: Int): Int = try { `in`.read(bytes, offset, length) } catch (e: Exception) { failed = true; throw e }
+    override fun skip(count: Long): Long = try { `in`.skip(count) } catch (e: Exception) { failed = true; throw e }
 }
