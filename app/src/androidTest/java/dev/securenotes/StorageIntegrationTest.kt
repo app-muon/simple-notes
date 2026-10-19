@@ -18,7 +18,17 @@ import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
 import androidx.core.content.FileProvider
 import androidx.test.platform.app.InstrumentationRegistry
+import dev.securenotes.backup.AttachmentFile
+import dev.securenotes.backup.AttachmentFolder
+import dev.securenotes.backup.AttachmentFolderNeeded
+import dev.securenotes.backup.BackupCodec
+import dev.securenotes.backup.BackupConfiguration
+import dev.securenotes.backup.BackupFolder
+import dev.securenotes.backup.BackupManifest
+import dev.securenotes.backup.BackupMode
 import dev.securenotes.backup.BackupService
+import dev.securenotes.backup.BackupSlot
+import dev.securenotes.backup.VaultBackupSettings
 import dev.securenotes.document.*
 import dev.securenotes.security.Crypto
 import dev.securenotes.storage.NotesRepository
@@ -450,6 +460,122 @@ class StorageIntegrationTest {
         assertEquals(2, backup.stage(source("legacy.ssnb", bytes.toByteArray()), "legacy password".toCharArray()) {})
         backup.commit()
         assertEquals(listOf(a, z), repository.notes.value)
+    }
+    /** A restore folder backed by app files, standing in for the folder picker's tree. */
+    private class FileFolder(private val root: File) : AttachmentFolder {
+        override fun list(directory: AttachmentFolder.Entry?) =
+            (if (directory == null) root else File(directory.id)).listFiles()!!.map { AttachmentFolder.Entry(it.absolutePath, it.name, it.isDirectory) }
+        override fun open(entry: AttachmentFolder.Entry) = File(entry.id).inputStream()
+    }
+    /** Writes a version-4 backup set as a pair does: one file per attachment, then the index. Returns the index and its folder. */
+    private suspend fun incrementalBackup(): Pair<Uri, File> {
+        repository.confirmPassphrase()
+        val snapshot = backup.capture {}
+        val key = Crypto.newStreamingKey()
+        val root = File(directory, "set-${newId()}"); val folder = File(root, "Notes-attachments").apply { mkdirs() }
+        val names = snapshot.attachments.associate { a ->
+            backup.prepareAttachment(snapshot, a, key).use { it.file.copyTo(File(folder, "${a.id}.ssna")) }
+            a.id to "${a.id}.ssna"
+        }
+        val index = backup.prepareIndex(snapshot, key, folder.name.takeIf { names.isNotEmpty() }, names).use { source("index.ssnb", it.file.readBytes()) }
+        return index to root
+    }
+    private suspend fun awaitFolder(index: Uri) {
+        try { backup.stage(index, phrase.toCharArray()) {}; fail("Staged without attachment files") }
+        catch (e: AttachmentFolderNeeded) { assertEquals("Notes-attachments", e.folder) }
+        assertTrue(backup.awaitingFolder); assertNull(backup.pending)
+    }
+    @Test fun incrementalBackupRestoresThroughItsAttachmentFolder() = runBlocking {
+        val first = repository.import(Note(title = "With files"), source("a.txt", "first".toByteArray()))
+        repository.import(first, source("b.bin", ByteArray(3 * 1024 * 1024 + 17) { (it % 253).toByte() }))
+        repository.save(Note(title = "Text only"))
+        val expected = repository.notes.value; val attachments = repository.attachments().values
+        val (index, root) = incrementalBackup()
+        expected.forEach { repository.delete(it.id) }; repository.save(Note(title = "Current"))
+        awaitFolder(index)
+        // A folder without the files leaves current notes untouched and the authenticated index waiting.
+        try { backup.stageFolder(FileFolder(File(root, "empty").apply { mkdirs() })) {}; fail("Accepted a folder without attachments") } catch (_: java.io.FileNotFoundException) { }
+        assertEquals("Current", repository.notes.value.single().title); assertTrue(backup.awaitingFolder); assertNull(backup.pending)
+        // The folder holding the attachment directory works, as does that directory itself after being renamed.
+        assertEquals(2, backup.stageFolder(FileFolder(root)) {})
+        backup.discard(); awaitFolder(index)
+        val renamed = File(root, "moved").also { assertTrue(File(root, "Notes-attachments").renameTo(it)) }
+        assertEquals(2, backup.stageFolder(FileFolder(renamed)) {})
+        assertFalse(backup.awaitingFolder)
+        backup.commit()
+        assertEquals(expected, repository.notes.value)
+        assertEquals(attachments.map { it.copy(indexed = false, nextPage = 0) }.toSet(), repository.attachments().values.map { it.copy(indexed = false, nextPage = 0) }.toSet())
+        repository.access { v -> attachments.forEach { a -> v.read(a.id).use { assertEquals(a.sha256, dev.securenotes.backup.ciphertextDigest(it)) } } }
+        assertEquals(phrase, repository.passphrase())
+    }
+    @Test fun incrementalRestoreRejectsMissingTruncatedSwappedAndAmbiguousFiles() = runBlocking {
+        val note = repository.import(repository.import(Note(title = "Keep"), source("a.txt", "first".toByteArray())), source("b.txt", "second".toByteArray()))
+        val (index, root) = incrementalBackup()
+        val pristine = File(root, "Notes-attachments")
+        val ids = repository.attachments().keys.toList()
+        fun file(folder: File, id: String) = File(folder, "$id.ssna")
+        val cases = mapOf<String, (File) -> Unit>(
+            "missing" to { file(it, ids[0]).delete() },
+            "truncated" to { f -> file(f, ids[0]).let { it.writeBytes(it.readBytes().copyOf(it.length().toInt() - 1)) } },
+            "swapped" to { f -> val a = file(f, ids[0]).readBytes(); file(f, ids[0]).writeBytes(file(f, ids[1]).readBytes()); file(f, ids[1]).writeBytes(a) },
+            "ambiguous" to { f -> val a = file(f, ids[0]); a.copyTo(File(f, "${ids[0]} (1).ssna")); a.renameTo(File(f, "${ids[0]} (2).ssna")) },
+        )
+        for ((name, damage) in cases) {
+            val copy = File(directory, "case-${newId()}").also { pristine.copyRecursively(File(it, pristine.name)) }
+            damage(File(copy, pristine.name))
+            awaitFolder(index)
+            try { backup.stageFolder(FileFolder(copy)) {}; fail("Accepted $name attachment files") } catch (_: Exception) { }
+            assertEquals(name, note, repository.notes.value.single()); assertNull(name, backup.pending); assertTrue(name, backup.awaitingFolder)
+            backup.discard()
+        }
+        // A provider collision suffix alone is fine: authentication, not the name, establishes identity.
+        val suffixed = File(directory, "suffixed-${newId()}").also { pristine.copyRecursively(it) }
+        assertTrue(file(suffixed, ids[0]).renameTo(File(suffixed, "${ids[0]} (1).ssna")))
+        awaitFolder(index); assertEquals(1, backup.stageFolder(FileFolder(suffixed)) {}); backup.discard()
+    }
+    @Test fun versionFourIndexesRejectExtraEntriesAndInvalidKeysAndNeedNoFolderWithoutAttachments() = runBlocking {
+        val note = Note(title = "Text"); repository.save(note)
+        fun index(key: String, extra: Boolean): Uri {
+            val manifest = BackupManifest(version = 4, notes = listOf(note), attachments = emptyList(), order = listOf(note.id), attachmentKey = key, attachmentFiles = emptyMap())
+            val bytes = java.io.ByteArrayOutputStream()
+            BackupCodec.encrypt(bytes, phrase.toCharArray()) { clear ->
+                val zip = java.util.zip.ZipOutputStream(clear)
+                zip.putNextEntry(java.util.zip.ZipEntry("manifest.json")); zip.write(documentJson.encodeToString(BackupManifest.serializer(), manifest).toByteArray()); zip.closeEntry()
+                if (extra) { zip.putNextEntry(java.util.zip.ZipEntry("attachments/${newId()}")); zip.write(1); zip.closeEntry() }
+                zip.finish(); zip.flush()
+            }
+            return source("v4.ssnb", bytes.toByteArray())
+        }
+        val key = BackupCodec.encodeKey(Crypto.newStreamingKey())
+        repository.delete(note.id); repository.save(Note(title = "Current"))
+        for (invalid in listOf(index(key, extra = true), index(BackupCodec.encodeKey(byteArrayOf(1, 2, 3)), extra = false))) {
+            try { backup.stage(invalid, phrase.toCharArray()) {}; fail("Accepted invalid index") } catch (e: Exception) { assertFalse(e is AttachmentFolderNeeded) }
+            assertEquals("Current", repository.notes.value.single().title); assertNull(backup.pending); assertFalse(backup.awaitingFolder)
+        }
+        assertEquals(1, backup.stage(index(key, extra = false), phrase.toCharArray()) {}); backup.commit()
+        assertEquals(note, repository.notes.value.single())
+    }
+    @Test fun restorePublicationCarriesThePairKeyAndAttachmentRecordsOnly() = runBlocking {
+        repository.save(Note(title = "Restored"))
+        val file = backup.create({})!!.first; sources += file
+        val tag = newId(); val other = newId()
+        val config = BackupConfiguration(mode = BackupMode.PAIR, folder = "content://synthetic/folder", slots = listOf("A", "B").map {
+            BackupSlot("content://synthetic/$it", "$it.ssnb", 123, "a".repeat(64))
+        }, active = 0, phraseHash = BackupService.phraseHash(phrase), fingerprint = "b".repeat(64), savedAt = 123,
+            pairTag = tag, attachmentFolder = BackupFolder("content://synthetic/folder/files", "files"))
+        repository.access { VaultBackupSettings.write(it, config) }
+        val settings = VaultBackupSettings(repository)
+        val record = AttachmentFile(newId(), 5, "c".repeat(64), "content://synthetic/folder/files/1", "1.ssna", 70, "d".repeat(64), complete = true)
+        settings.saveKey(tag, byteArrayOf(1, 2, 3)) {}; settings.saveFile(tag, record) {}
+        settings.saveKey(other, byteArrayOf(4)) {}; settings.saveFile(other, record) {}
+        backup.stage(source("pair.ssnb", file.readBytes()), phrase.toCharArray()) {}
+        backup.commit()
+        val restored = settings.load()
+        assertEquals(tag, restored.pairTag); assertEquals(config.attachmentFolder, restored.attachmentFolder); assertTrue(restored.pending)
+        assertArrayEquals(byteArrayOf(1, 2, 3), settings.key(tag)); assertEquals(mapOf(record.id to record), settings.files(tag))
+        assertNull(settings.key(other)); assertTrue(settings.files(other).isEmpty())
+        settings.forget(tag)
+        assertNull(settings.key(tag)); assertTrue(settings.files(tag).isEmpty())
     }
     @Test fun corruptRestoreDoesNotReplaceExistingNotesAndCancelledStageIsDiscarded() = runBlocking {
         val note = Note(title = "Preserve me"); repository.save(note)

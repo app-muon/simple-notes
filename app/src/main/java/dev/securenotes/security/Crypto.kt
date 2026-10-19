@@ -3,6 +3,7 @@ package dev.securenotes.security
 import com.google.crypto.tink.BinaryKeysetReader
 import com.google.crypto.tink.BinaryKeysetWriter
 import com.google.crypto.tink.CleartextKeysetHandle
+import com.google.crypto.tink.KeyStatus
 import com.google.crypto.tink.KeyTemplates
 import com.google.crypto.tink.KeysetHandle
 import com.google.crypto.tink.StreamingAead
@@ -51,5 +52,15 @@ object Crypto {
     }
     @Suppress("DEPRECATION")
     fun streaming(keyset: ByteArray): StreamingAead = CleartextKeysetHandle.read(BinaryKeysetReader.withBytes(keyset)).getPrimitive(StreamingAead::class.java)
+    /** Accepts only a keyset like [newStreamingKey] makes: one enabled primary AES256_GCM_HKDF_1MB key, at most 4096 bytes. */
+    @Suppress("DEPRECATION")
+    fun checkStreamingKey(keyset: ByteArray) {
+        require(keyset.size in 1..4096) { "Invalid keyset size" }
+        val handle = CleartextKeysetHandle.read(BinaryKeysetReader.withBytes(keyset))
+        require(handle.size() == 1) { "Unexpected keyset" }
+        val entry = handle.getAt(0)
+        require(entry.isPrimary && entry.status == KeyStatus.ENABLED) { "Unexpected keyset" }
+        require(entry.key.parameters == KeyTemplates.get("AES256_GCM_HKDF_1MB").toParameters()) { "Unexpected keyset" }
+    }
     fun hash(bytes: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(bytes)
 }

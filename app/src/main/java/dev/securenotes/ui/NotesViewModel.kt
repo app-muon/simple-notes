@@ -61,6 +61,9 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     var busy by mutableStateOf<String?>(null)
     var restoreUri by mutableStateOf<Uri?>(null)
     var restoreCount by mutableStateOf<Int?>(null)
+    /** The recorded attachment folder name, shown while an authenticated version-4 backup waits for that folder. */
+    var restoreFolder by mutableStateOf<String?>(null)
+    private var restoreFolderPicked: String? = null
     var passwordMode by mutableStateOf<String?>(null)
     var share by mutableStateOf<SharedContent?>(null)
     var choosingDestination by mutableStateOf(false)
@@ -117,7 +120,7 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
                 note = null; attachments = emptyMap(); results = emptyList(); query = ""; hit = null
                 clearFind(); filter = NoteFilter(); listAnchor = null; listOffset = 0
                 history.clear(); historyRevision++; screen = Screen.LIST; editing = false
-                busy = null; passwordMode = null; restoreCount = null; setupWords = null; revealedWords = null; backupProviderWarning = null; restoreUri = null
+                busy = null; passwordMode = null; restoreCount = null; restoreFolder = null; restoreFolderPicked = null; setupWords = null; revealedWords = null; backupProviderWarning = null; restoreUri = null
                 backupSetupToken = null; reviewingBackup = false; newDraft = false; imageId = null; focusTitle = false; bodyFocus = null
                 pendingSave = null
             } else { keyUnavailable = false; reconcileTags(); reloadAttachments() }
@@ -345,7 +348,7 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     fun submitPassword(password: CharArray) {
         passwordMode = null
         task("Validating backup…", "The backup could not be restored. Check the passphrase, file integrity, version, and available storage.") {
-            try { restoreCount = backups.stage(checkNotNull(restoreUri), password, ::progress) }
+            try { stageRestore(checkNotNull(restoreUri), password) }
             catch (_: dev.securenotes.backup.BackupPasswordException) { passwordMode = "restore"; error = "Incorrect recovery phrase or damaged backup. You can try again." }
             finally { password.fill('\u0000') }
         }
@@ -358,9 +361,28 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
             backups.checkHeader(uri); restoreUri = uri
             val words = if (repository.passphraseConfirmed.value == true) repository.access { it.passphrase() }?.toCharArray() else null
             if (words == null) passwordMode = "restore"
-            else try { restoreCount = backups.stage(uri, words, ::progress) }
+            else try { stageRestore(uri, words) }
             catch (_: dev.securenotes.backup.BackupPasswordException) { passwordMode = "restore" }
             finally { words.fill('\u0000') }
+        }
+    }
+    private suspend fun stageRestore(uri: Uri, words: CharArray) {
+        try { restoreCount = backups.stage(uri, words, ::progress) }
+        catch (e: dev.securenotes.backup.AttachmentFolderNeeded) { restoreFolder = e.folder ?: "" }
+    }
+    /** Hides the folder prompt while the picker is open; the authenticated index waits in [backups] until locking. */
+    fun chooseRestoreFolder(launch: () -> Unit) {
+        val folder = restoreFolder ?: return
+        restoreFolderPicked = folder; restoreFolder = null
+        try { launch() } catch (_: Exception) { restoreFolderPicked = null; restoreFolder = folder; error = "The folder picker could not be opened. Try again." }
+    }
+    fun selectRestoreFolder(uri: Uri?) {
+        val folder = restoreFolderPicked ?: return
+        restoreFolderPicked = null
+        if (uri == null) { cancelRestore(); return }
+        task("Validating attachments…", "The attachments could not be restored. Choose the folder that holds this backup's attachments and check that every file has finished syncing. Your current notes were not changed.") {
+            try { restoreCount = backups.stageFolder(dev.securenotes.backup.DocumentTreeFolder(app.contentResolver, uri), ::progress) }
+            catch (e: Exception) { if (e !is CancellationException && backups.awaitingFolder) restoreFolder = folder; throw e }
         }
     }
     fun confirmPassphrase() { task(null, "The confirmation could not be saved.") { repository.confirmPassphrase() } }
@@ -430,7 +452,7 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
             backups.commit(); clearFind(); note = null; filter = NoteFilter(); reloadAttachments(); screen = Screen.LIST; app.startIndexing()
         }
     }
-    fun cancelRestore() { backups.discard(); restoreCount = null }
+    fun cancelRestore() { backups.discard(); restoreCount = null; restoreFolder = null; restoreFolderPicked = null }
     fun selectFilter(value: NoteFilter) {
         filter = value; listAnchor = null; listOffset = 0
         if (screen == Screen.SEARCH) search(query)

@@ -63,6 +63,9 @@ data class PostingRow(@PrimaryKey(autoGenerate = true) val id: Long = 0, val sou
     @Query("SELECT value FROM secrets WHERE name = :name") suspend fun secret(name: String): ByteArray?
     @Upsert suspend fun putSecret(secret: SecretRow)
     @Query("DELETE FROM secrets WHERE name = :name") suspend fun deleteSecret(name: String)
+    // substr, not LIKE: LIKE treats _ and % as wildcards and ignores ASCII case.
+    @Query("SELECT * FROM secrets WHERE substr(name, 1, length(:prefix)) = :prefix") suspend fun secrets(prefix: String): List<SecretRow>
+    @Query("DELETE FROM secrets WHERE substr(name, 1, length(:prefix)) = :prefix") suspend fun deleteSecrets(prefix: String)
     @Query("SELECT * FROM imports") suspend fun imports(): List<ImportRow>
     @Upsert suspend fun putImport(row: ImportRow)
     @Query("DELETE FROM imports WHERE id = :id") suspend fun deleteImport(id: String)

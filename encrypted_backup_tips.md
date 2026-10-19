@@ -70,7 +70,17 @@ Show the "last saved" time and the latest error in Settings. For unexpected fail
 
 Existing single-file backups become migration-required history and are never overwritten again. Create a fresh pair through folder selection. Restore tries the confirmed device phrase first, then asks for words if envelope authentication fails. The successful phrase becomes the recovery phrase. If it differs from the configured pair, review it after authentication and create a new pair; preserve both old files under their original words. Never silently replace an established missing phrase.
 
-The .ssnb streaming format, fresh salts/keys, attachment handling, and 16 MiB manifest limit are unchanged. There is no total backup size limit, plaintext configuration/export path, cached derived key, or invented creation timestamp. See [the format](docs/backup-format.md) and [security decisions](docs/security.md).
+The .ssnb streaming format, fresh salts/keys and 16 MiB manifest limit are unchanged. There is no total backup size limit, plaintext configuration/export path, cached derived key, or invented creation timestamp. See [the format](docs/backup-format.md) and [security decisions](docs/security.md).
+
+### Large attachments: save each one once
+
+Rewriting every attachment on every save makes a photo-heavy collection expensive: the per-save salt changes every byte, so the sync app uploads everything again after each pause in editing. Attachments never change after import, so save each one once, in its own encrypted file, and keep only an index in the A/B files.
+
+- **Sync the whole folder, including subfolders.** An index may reach the cloud before its attachments.
+- **Record each file before writing it, and complete it only after reading it back.** Commit fresh ciphertext measurements before reopening an unfinished file; never reopen a completed one; never adopt a file by name.
+- **Check cheaply on every save, fully on request.** One directory listing confirms each completed file's size without reading it. Require two independent signals (listing and the file's own descriptor) before calling a file damaged; one listing can be stale.
+- **Keep completed files for the pair's lifetime.** Both indexes, and older copies in the cloud, may still name them.
+- **Restore from a file, then a folder.** Authenticate the index completely, then ask for the folder holding its attachments; authentication, not the filename, establishes identity.
 
 ## Testing
 

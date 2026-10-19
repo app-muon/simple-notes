@@ -10,10 +10,13 @@ import dev.securenotes.R
 import dev.securenotes.backup.*
 
 internal fun backupErrorResource(error: BackupError, setup: Boolean = false): Int = when {
-    setup && error.problem in setOf(BackupProblem.IO, BackupProblem.INVALID_CONFIGURATION, BackupProblem.ACTIVE_DAMAGED) -> R.string.backup_setup_io
+    setup && error.problem in setOf(BackupProblem.IO, BackupProblem.INVALID_CONFIGURATION, BackupProblem.ACTIVE_DAMAGED, BackupProblem.ATTACHMENT_DAMAGED) -> R.string.backup_setup_io
     setup && error.problem == BackupProblem.ACCESS -> R.string.backup_setup_access
     error.step == "verify-active" && error.problem == BackupProblem.ACCESS -> R.string.backup_active_access
     error.step == "verify-active" && error.problem == BackupProblem.IO -> R.string.backup_active_unverified
+    error.step == "check-attachments" && error.problem == BackupProblem.ACCESS -> R.string.backup_attachments_access
+    error.step == "check-attachments" && error.problem == BackupProblem.IO -> R.string.backup_attachments_unverified
+    error.step == "attachment-identity" && error.problem == BackupProblem.ATTACHMENT_DAMAGED -> R.string.backup_attachment_conflict
     else -> when (error.problem) {
         BackupProblem.IO -> R.string.backup_io
         BackupProblem.ACCESS -> R.string.backup_access
@@ -21,6 +24,7 @@ internal fun backupErrorResource(error: BackupError, setup: Boolean = false): In
         BackupProblem.PHRASE_MISSING -> R.string.backup_phrase_missing
         BackupProblem.PHRASE_CHANGED -> R.string.backup_phrase_changed
         BackupProblem.ACTIVE_DAMAGED -> R.string.backup_damaged
+        BackupProblem.ATTACHMENT_DAMAGED -> R.string.backup_attachment_damaged
         BackupProblem.INVALID_CONFIGURATION -> R.string.backup_configuration
         BackupProblem.BUSY -> R.string.backup_busy
         BackupProblem.RESTART_REQUIRED -> R.string.backup_restart

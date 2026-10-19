@@ -1,10 +1,13 @@
 package dev.securenotes.backup
 
+import dev.securenotes.document.newId
+import dev.securenotes.security.Crypto
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.io.FileNotFoundException
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
@@ -94,7 +97,7 @@ class AutoBackup(
         return when ((transientError ?: config.error)?.problem) {
             BackupProblem.ACCESS -> grantAvailable == true
             BackupProblem.MANIFEST_TOO_LARGE -> pendingEdits || oversizedRevision != source.revision
-            BackupProblem.PHRASE_CHANGED, BackupProblem.PHRASE_MISSING, BackupProblem.ACTIVE_DAMAGED,
+            BackupProblem.PHRASE_CHANGED, BackupProblem.PHRASE_MISSING, BackupProblem.ACTIVE_DAMAGED, BackupProblem.ATTACHMENT_DAMAGED,
             BackupProblem.INVALID_CONFIGURATION, BackupProblem.RESTART_REQUIRED -> false
             else -> force || pendingEdits || config.pending || config.error != null || transientError != null || savedRevision != source.revision
         }
@@ -127,12 +130,22 @@ class AutoBackup(
             throw e
         }
     }
+    /** Commits a key or attachment record. Like [persist], an uncertain outcome blocks backup mutations until restart. */
+    private suspend fun record(write: suspend (() -> Unit) -> Unit) {
+        var started = false
+        try { write { started = true } }
+        catch (e: Exception) {
+            if (started) { restartRequired = true; transientError = BackupError(BackupProblem.RESTART_REQUIRED, "record", files.diagnostic(e)); publish() }
+            throw e
+        }
+    }
     private fun error(e: Exception, step: String): BackupError = BackupError(when {
         e.hasSecurityCause() -> BackupProblem.ACCESS
         e is BackupFailure -> e.problem
         e is ManifestTooLarge -> BackupProblem.MANIFEST_TOO_LARGE
         else -> BackupProblem.IO
     }, step, files.diagnostic(e))
+    private fun timestamp(): String = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmssSSS'Z'").withZone(ZoneOffset.UTC).format(Instant.ofEpochMilli(clock()))
 
     suspend fun run(force: Boolean = false, progress: (String) -> Unit = {}) = mutex.withLock {
         val config = trusted ?: return@withLock
@@ -151,25 +164,36 @@ class AutoBackup(
             }
             // Fail before encryption/KDF work for an unreadable or already damaged active file.
             withContext(io) { report("verify-active"); requireGrant(checkNotNull(config.folder)); files.verify(config.slots[config.active]) }
+            val tag = config.pairTag
+            val recorded = tag?.let { settings.files(it) }
+            if (recorded != null) checkAttachments(config, recorded.values, ::report)
             report("prepare")
-            source.prepare(progress).use { artifact ->
+            val prepared = if (tag == null) source.prepare(progress)
+                else prepareIncremental(config, tag, checkNotNull(recorded), force, progress, ::report) ?: return@withLock
+            prepared.use { artifact ->
                 if (artifact.content.phraseHash != config.phraseHash) throw BackupFailure(BackupProblem.PHRASE_CHANGED)
                 if (!force && artifact.content.empty) return@withLock
                 // The provider may have changed while encryption ran. Verify again just before writing.
                 withContext(io) { report("verify-active"); requireGrant(checkNotNull(config.folder)); files.verify(config.slots[config.active]) }
+                // Saving the first attachment may have recorded the pair's new attachment folder.
+                val current = checkNotNull(trusted)
                 // Lock before the write begins is cancellation, not an uncertain commit.
-                report("record-pending"); persist(config.copy(pending = true))
+                report("record-pending"); persist(current.copy(pending = true))
                 withContext(NonCancellable + io) {
-                    val inactive = 1 - config.active
-                    report("access"); requireGrant(checkNotNull(config.folder))
-                    files.writeVerified(config.slots[inactive].uri, artifact, ::report)
-                    val slots = config.slots.toMutableList().also { it[inactive] = it[inactive].copy(length = artifact.length, sha256 = artifact.sha256) }
+                    val inactive = 1 - current.active
+                    report("access"); requireGrant(checkNotNull(current.folder))
+                    files.writeVerified(current.slots[inactive].uri, artifact, ::report)
+                    val slots = current.slots.toMutableList().also { it[inactive] = it[inactive].copy(length = artifact.length, sha256 = artifact.sha256) }
                     report("record-success")
-                    persist(config.copy(slots = slots, active = inactive, fingerprint = artifact.content.fingerprint, savedAt = clock(), pending = false, error = null))
+                    persist(current.copy(slots = slots, active = inactive, fingerprint = artifact.content.fingerprint, savedAt = clock(), pending = false, error = null))
                     savedRevision = artifact.content.revision; oversizedRevision = null
                 }
             }
         } catch (e: CancellationException) { throw e }
+        catch (_: SnapshotChanged) {
+            // The edit that removed the attachment also schedules a fresh attempt with current metadata.
+            savedRevision = null
+        }
         catch (e: Exception) {
             savedRevision = null
             if (e is ManifestTooLarge) oversizedRevision = e.revision
@@ -185,6 +209,110 @@ class AutoBackup(
         } finally { operation = null; publish() }
     }
 
+    /**
+     * Confirms from one listing, without reading any, that every completed attachment file is present at its recorded
+     * size. Damage needs a second signal from the document itself; anything less leaves the files unverified.
+     */
+    private suspend fun checkAttachments(config: BackupConfiguration, recorded: Collection<AttachmentFile>, report: (String) -> Unit) = withContext(io) {
+        val completed = recorded.filter { it.complete }
+        if (completed.isEmpty()) return@withContext
+        report("check-attachments")
+        val directory = config.attachmentFolder ?: throw BackupFailure(BackupProblem.INVALID_CONFIGURATION)
+        requireGrant(checkNotNull(config.folder))
+        val listed = files.children(directory.uri).associateBy { it.uri }
+        for (file in completed) {
+            val child = listed[file.uri]
+            if (child != null && child.size == file.length) continue
+            if (child != null && child.size == null) throw BackupFailure(BackupProblem.IO)
+            val measured = try { files.measure(file.uri) }
+            catch (_: FileNotFoundException) { throw BackupFailure(if (child == null) BackupProblem.ATTACHMENT_DAMAGED else BackupProblem.IO) }
+            throw BackupFailure(if (child != null && measured != null && measured == child.size) BackupProblem.ATTACHMENT_DAMAGED else BackupProblem.IO)
+        }
+    }
+
+    /** Captures the content, saves each attachment without a completed file, and prepares the version-4 index. */
+    private suspend fun prepareIncremental(config: BackupConfiguration, tag: String, recorded: Map<String, AttachmentFile>, force: Boolean,
+                                           progress: (String) -> Unit, report: (String) -> Unit): PreparedBackup? {
+        val snapshot = source.capture(progress)
+        if (snapshot.content.phraseHash != config.phraseHash) throw BackupFailure(BackupProblem.PHRASE_CHANGED)
+        if (!force && snapshot.content.empty) return null
+        // Attachments never change; the same ID with other content cannot share this pair's files.
+        if (snapshot.attachments.any { a -> recorded[a.id]?.let { it.size != a.size || it.sha256 != a.sha256 } == true }) {
+            report("attachment-identity"); throw BackupFailure(BackupProblem.ATTACHMENT_DAMAGED)
+        }
+        val key = settings.key(tag) ?: throw BackupFailure(BackupProblem.INVALID_CONFIGURATION)
+        try {
+            val saved = recorded.toMutableMap()
+            val missing = snapshot.attachments.filter { saved[it.id]?.complete != true }
+            val grant = checkNotNull(config.folder)
+            var directory = config.attachmentFolder
+            missing.forEachIndexed { index, attachment ->
+                progress("Saving new attachment ${index + 1} of ${missing.size}")
+                val target = directory ?: newAttachmentFolder(grant, checkNotNull(trusted).managedUris, report).also { made ->
+                    report("record-folder"); persist(checkNotNull(trusted).copy(attachmentFolder = made))
+                    directory = made
+                }
+                val known = checkNotNull(trusted).managedUris + saved.values.map { it.uri }
+                saved[attachment.id] = saveAttachment(tag, grant, target.uri, snapshot, attachment, saved[attachment.id], key, known, report)
+            }
+            report("prepare-index")
+            return source.prepareIndex(snapshot, key, directory?.name, snapshot.attachments.associate { it.id to saved.getValue(it.id).name })
+        } finally { key.fill(0) }
+    }
+
+    /** Created when a pair saves its first attachment; an index never names a folder the provider did not confirm. */
+    private suspend fun newAttachmentFolder(grant: String, known: Set<String>, report: (String) -> Unit, created: MutableList<String>? = null): BackupFolder = withContext(io) {
+        report("create-folder"); requireGrant(grant)
+        val name = "Notes-${timestamp()}-attachments"
+        val uri = files.createDirectory(grant, name)
+        if (uri.isBlank() || uri in known || created?.contains(uri) == true) throw BackupFailure(BackupProblem.INVALID_CONFIGURATION)
+        created?.add(uri)
+        val document = files.document(uri, name)
+        if (!document.nameConfirmed) { runCatching { files.delete(uri) }; throw BackupFailure(BackupProblem.IO) }
+        BackupFolder(document.uri, document.name)
+    }
+
+    /**
+     * Writes one attachment file. A recorded but unfinished document is first checked against its expected measurements;
+     * otherwise fresh measurements are committed before it is reopened for writing. Completed files are never reopened.
+     */
+    private suspend fun saveAttachment(tag: String, grant: String, directory: String, snapshot: BackupSnapshot, attachment: BackupAttachment,
+                                       unfinished: AttachmentFile?, key: ByteArray, known: Set<String>, report: (String) -> Unit,
+                                       created: MutableList<String>? = null): AttachmentFile {
+        check(unfinished?.complete != true)
+        suspend fun save(file: AttachmentFile): AttachmentFile { report("record-attachment"); record { begin -> settings.saveFile(tag, file, begin) }; return file }
+        suspend fun write(file: AttachmentFile, artifact: PreparedBackup): AttachmentFile {
+            save(file)
+            withContext(io) { requireGrant(grant); files.writeVerified(file.uri, artifact) { report("attachment-$it") } }
+            return save(file.copy(complete = true))
+        }
+        if (unfinished != null) {
+            report("check-unfinished")
+            val written = withContext(io) {
+                requireGrant(grant)
+                try { files.verify(BackupSlot(unfinished.uri, "", unfinished.length, unfinished.digest)); true }
+                catch (_: BackupFailure) { false }
+                catch (_: FileNotFoundException) { null }
+            }
+            if (written == true) return save(unfinished.copy(complete = true))
+            if (written == false) return source.prepareAttachment(snapshot, attachment, key).use { artifact ->
+                write(unfinished.copy(length = artifact.length, digest = artifact.sha256), artifact)
+            }
+            // The unfinished document is gone; a new document replaces its record.
+        }
+        return source.prepareAttachment(snapshot, attachment, key).use { artifact ->
+            val name = "${attachment.id}.ssna"
+            val document = withContext(io) {
+                report("create-attachment"); requireGrant(grant)
+                val uri = files.create(directory, name)
+                if (uri.isBlank() || uri == directory || uri in known || created?.contains(uri) == true) throw BackupFailure(BackupProblem.INVALID_CONFIGURATION)
+                created?.add(uri)
+                files.document(uri, name).also { if (!it.nameConfirmed) { runCatching { files.delete(uri) }; throw BackupFailure(BackupProblem.IO) } }
+            }
+            write(AttachmentFile(attachment.id, attachment.size, attachment.sha256, document.uri, document.name, artifact.length, artifact.sha256), artifact)
+        }
+    }
+
     /** Reject delayed picker callbacks when busy. Never adopt a document by name. */
     suspend fun choose(folder: String, progress: (String) -> Unit = {}): BackupAdmission {
         val admission = admission()
@@ -192,53 +320,75 @@ class AutoBackup(
         if (!mutex.tryLock()) return rejectSetup(BackupAdmission.BUSY)
         val old = checkNotNull(trusted)
         val created = mutableListOf<String>()
+        var pairTag: String? = null
         var hadGrant = true
         var commitStarted = false
         var committed = false
         var step = "prepare"
         operation = "setup"; setupError = null; publish()
+        val report: (String) -> Unit = { step = it; operation = "setup-$it"; publish() }
         try {
             if (!unlocked()) return rejectSetup(BackupAdmission.LOCKED)
             if (restartRequired) return rejectSetup(BackupAdmission.RESTART_REQUIRED)
-            source.prepare(progress).use { artifact ->
-                if (old.mode == BackupMode.PAIR && old.phraseHash != artifact.content.phraseHash && reviewedPhrase != artifact.content.phraseHash) throw BackupFailure(BackupProblem.PHRASE_CHANGED)
-                currentCoroutineContext().ensureActive()
-                if (!unlocked()) throw CancellationException()
-                withContext(io) {
-                    hadGrant = files.hasAnyGrant(folder)
-                    files.retain(folder)
-                    requireGrant(folder)
-                }
-                val timestamp = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmssSSS'Z'").withZone(ZoneOffset.UTC).format(Instant.ofEpochMilli(clock()))
-                val slots = withContext(io) {
-                    listOf("A", "B").map { label ->
-                        currentCoroutineContext().ensureActive()
-                        step = "create-$label"
-                        requireGrant(folder)
-                        val requested = "Notes-$timestamp-$label.ssnb"
-                        val uri = files.create(folder, requested)
-                        if (uri.isBlank() || uri in old.managedUris || uri in created) throw BackupFailure(BackupProblem.INVALID_CONFIGURATION)
-                        created += uri
-                        val document = files.document(uri, requested)
-                        files.writeVerified(document.uri, artifact) { step = it; operation = "setup-$it"; publish() }
-                        BackupSlot(document.uri, document.name, artifact.length, artifact.sha256, document.nameConfirmed)
-                    }
-                }
-                val next = BackupConfiguration(mode = BackupMode.PAIR, folder = folder, slots = slots, active = 1,
-                    phraseHash = artifact.content.phraseHash, fingerprint = artifact.content.fingerprint, savedAt = clock())
-                next.validate(); step = "record-setup"
-                persist(next) { commitStarted = true }
-                committed = true; savedRevision = artifact.content.revision; oversizedRevision = null; reviewedPhrase = null; grantAvailable = true
+            val snapshot = source.capture(progress)
+            if (old.mode == BackupMode.PAIR && old.phraseHash != snapshot.content.phraseHash && reviewedPhrase != snapshot.content.phraseHash) throw BackupFailure(BackupProblem.PHRASE_CHANGED)
+            currentCoroutineContext().ensureActive()
+            if (!unlocked()) throw CancellationException()
+            withContext(io) {
+                hadGrant = files.hasAnyGrant(folder)
+                files.retain(folder)
+                requireGrant(folder)
             }
+            val timestamp = timestamp()
+            val tag = newId().also { pairTag = it }
+            val key = Crypto.newStreamingKey()
+            try {
+                step = "record-key"; record { begin -> settings.saveKey(tag, key, begin) }
+                var directory: BackupFolder? = null
+                val saved = mutableMapOf<String, AttachmentFile>()
+                snapshot.attachments.forEachIndexed { index, attachment ->
+                    progress("Saving attachment ${index + 1} of ${snapshot.attachments.size}")
+                    val target = directory ?: newAttachmentFolder(folder, old.managedUris, report, created).also { directory = it }
+                    saved[attachment.id] = saveAttachment(tag, folder, target.uri, snapshot, attachment, null, key, old.managedUris, report, created)
+                }
+                step = "prepare-index"
+                source.prepareIndex(snapshot, key, directory?.name, snapshot.attachments.associate { it.id to saved.getValue(it.id).name }).use { artifact ->
+                    val slots = withContext(io) {
+                        listOf("A", "B").map { label ->
+                            currentCoroutineContext().ensureActive()
+                            step = "create-$label"
+                            requireGrant(folder)
+                            val requested = "Notes-$timestamp-$label.ssnb"
+                            val uri = files.create(folder, requested)
+                            if (uri.isBlank() || uri in old.managedUris || uri in created) throw BackupFailure(BackupProblem.INVALID_CONFIGURATION)
+                            created += uri
+                            val document = files.document(uri, requested)
+                            files.writeVerified(document.uri, artifact, report)
+                            BackupSlot(document.uri, document.name, artifact.length, artifact.sha256, document.nameConfirmed)
+                        }
+                    }
+                    val next = BackupConfiguration(mode = BackupMode.PAIR, folder = folder, slots = slots, active = 1,
+                        phraseHash = artifact.content.phraseHash, fingerprint = artifact.content.fingerprint, savedAt = clock(),
+                        pairTag = tag, attachmentFolder = directory)
+                    next.validate(); step = "record-setup"
+                    persist(next) { commitStarted = true }
+                    committed = true; savedRevision = artifact.content.revision; oversizedRevision = null; reviewedPhrase = null; grantAvailable = true
+                }
+            } finally { key.fill(0) }
             return BackupAdmission.ACCEPTED
         } catch (e: CancellationException) { throw e }
         catch (e: Exception) { setupError = error(e, step); return BackupAdmission.FAILED }
         finally {
             withContext(NonCancellable + io) {
                 if (!commitStarted) {
-                    created.forEach { runCatching { files.delete(it) } }
+                    // Attachment files before their folder, which some providers delete only when empty.
+                    created.asReversed().forEach { runCatching { files.delete(it) } }
+                    pairTag?.let { runCatching { settings.forget(it) } }
                     if (!hadGrant && folder != old.grant) runCatching { files.release(folder) }
-                } else if (committed) old.grant?.takeIf { it != folder }?.let { runCatching { files.release(it) } }
+                } else if (committed) {
+                    old.grant?.takeIf { it != folder }?.let { runCatching { files.release(it) } }
+                    old.pairTag?.let { runCatching { settings.forget(it) } }
+                }
             }
             operation = null; publish(); mutex.unlock()
         }
@@ -250,7 +400,10 @@ class AutoBackup(
         try {
             val old = checkNotNull(trusted)
             persist(BackupConfiguration())
-            withContext(NonCancellable + io) { old.grant?.let { runCatching { files.release(it) } } }
+            withContext(NonCancellable + io) {
+                old.grant?.let { runCatching { files.release(it) } }
+                old.pairTag?.let { runCatching { settings.forget(it) } }
+            }
             savedRevision = null; oversizedRevision = null; setupError = null; grantAvailable = null
             return BackupAdmission.ACCEPTED
         } finally { publish(); mutex.unlock() }

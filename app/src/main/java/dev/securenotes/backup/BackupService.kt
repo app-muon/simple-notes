@@ -8,22 +8,36 @@ import dev.securenotes.document.*
 import dev.securenotes.security.Crypto
 import dev.securenotes.security.Passphrase
 import dev.securenotes.storage.*
+import kotlinx.serialization.EncodeDefault
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import java.io.*
+import java.security.MessageDigest
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
+/**
+ * Versions 1–3 contain their attachments. Version 4 is an index: its attachments are separate files in [attachmentFolder],
+ * named by [attachmentFiles] and encrypted under [attachmentKey]. Version-4 fields are omitted from earlier versions, so
+ * their bytes and content fingerprints are unchanged.
+ */
+@OptIn(ExperimentalSerializationApi::class)
 @Serializable data class BackupManifest(
     val version: Int = 3, val notes: List<Note>, val attachments: List<AttachmentRow>,
     val sort: SortOrder? = null, val order: List<String>? = null,
     val tags: List<Tag> = emptyList(),
+    @EncodeDefault(EncodeDefault.Mode.NEVER) val attachmentKey: String? = null,
+    @EncodeDefault(EncodeDefault.Mode.NEVER) val attachmentFolder: String? = null,
+    @EncodeDefault(EncodeDefault.Mode.NEVER) val attachmentFiles: Map<String, String>? = null,
 ) {
     fun orderedIds(): List<String> = if (version == 1) sortedNotes(notes, checkNotNull(sort)).map(Note::id) else checkNotNull(order)
 }
+/** A version-4 index was authenticated; its attachments need read access to the folder that holds them. */
+class AttachmentFolderNeeded(val folder: String?) : Exception()
 
 class BackupService(private val context: Context, private val repository: NotesRepository, private val checkAccess: () -> Unit) : BackupSource {
     override val revision: Long get() = repository.changes.value
@@ -38,6 +52,10 @@ class BackupService(private val context: Context, private val repository: NotesR
     private val cache = File(context.cacheDir, "backups").apply { mkdirs() }
     @Volatile var pending: Vault? = null
         private set
+    /** An authenticated version-4 index and the phrase that opened it, until its attachments are staged or discarded. */
+    private class Waiting(val manifest: BackupManifest, val phrase: String)
+    @Volatile private var waiting: Waiting? = null
+    val awaitingFolder: Boolean get() = waiting != null
     private data class Snapshot(val manifest: BackupManifest, val bytes: ByteArray, val content: BackupInspection, val phrase: String)
     private suspend fun snapshot(v: Vault, requireConfirmed: Boolean): Snapshot {
         val capturedRevision = revision
@@ -59,26 +77,59 @@ class BackupService(private val context: Context, private val repository: NotesR
     override suspend fun inspect(): BackupInspection = repository.access { snapshot(it, true).content }
     override suspend fun prepare(progress: (String) -> Unit): PreparedBackup {
         var artifact: PreparedBackup? = null
-        try { return repository.access { encrypt(it, snapshot(it, true), progress).also { result -> artifact = result } } }
+        try { return repository.access { v -> snapshot(v, true).let { encrypt(v, it.bytes, it.manifest.attachments, it.phrase, it.content, progress) }.also { result -> artifact = result } } }
         catch (e: Exception) { artifact?.close(); throw e }
+    }
+    override suspend fun capture(progress: (String) -> Unit): BackupSnapshot = repository.access { v ->
+        val snapshot = snapshot(v, true)
+        BackupSnapshot(snapshot.content, snapshot.manifest.attachments.map { BackupAttachment(it.id, it.size, it.sha256) }, snapshot.manifest)
+    }
+    // The repository mutex keeps the blob from being deleted while it is read.
+    override suspend fun prepareAttachment(snapshot: BackupSnapshot, attachment: BackupAttachment, key: ByteArray): PreparedBackup = repository.access { v ->
+        val operation = currentCoroutineContext()
+        val row = v.dao.attachment(attachment.id)
+        if (row == null || row.size != attachment.size || row.sha256 != attachment.sha256) throw SnapshotChanged()
+        val output = File(cache, "${newId()}.ssna")
+        try {
+            checkAccess(); operation.ensureActive()
+            val digest = MessageDigest.getInstance("SHA-256")
+            var size = 0L
+            output.outputStream().buffered().use { encrypted -> AttachmentCodec.encrypt(encrypted, key, attachment.id) { clear ->
+                val measured = object : FilterOutputStream(clear) {
+                    override fun write(value: Int) { out.write(value); digest.update(value.toByte()); size++ }
+                    override fun write(bytes: ByteArray, offset: Int, length: Int) { out.write(bytes, offset, length); digest.update(bytes, offset, length); size += length }
+                }
+                v.read(attachment.id).use { copyChecked(it, measured) { operation.ensureActive() } }
+            } }
+            // A vault blob that no longer matches its row must never reach a backup.
+            if (size != attachment.size || digest.digest().hex() != attachment.sha256) throw IOException("Attachment integrity failure")
+            checkAccess(); operation.ensureActive()
+            PreparedBackup(output, snapshot.content, output.length(), output.inputStream().use(::ciphertextDigest))
+        } catch (e: Exception) { output.delete(); throw e }
+    }
+    override suspend fun prepareIndex(snapshot: BackupSnapshot, key: ByteArray, folder: String?, files: Map<String, String>): PreparedBackup = repository.access { v ->
+        val phrase = v.passphrase()?.let(Passphrase::normalize)?.takeIf { it.isNotBlank() } ?: throw BackupFailure(BackupProblem.PHRASE_MISSING)
+        if (phraseHash(phrase) != snapshot.content.phraseHash) throw BackupFailure(BackupProblem.PHRASE_CHANGED)
+        val bytes = indexBytes(snapshot.manifest as BackupManifest, key, folder, files, snapshot.content.revision)
+        encrypt(v, bytes, emptyList(), phrase, snapshot.content) {}
     }
     /** Test fixtures deliberately bypass phrase confirmation; production [prepare] always requires it. */
     @VisibleForTesting
     internal suspend fun create(progress: (String) -> Unit, unchangedSince: String? = null): Pair<File, String>? = repository.access { v ->
         val snapshot = snapshot(v, false)
-        if (snapshot.content.fingerprint == unchangedSince) null else encrypt(v, snapshot, progress).let { it.file to it.content.fingerprint }
+        if (snapshot.content.fingerprint == unchangedSince) null
+        else encrypt(v, snapshot.bytes, snapshot.manifest.attachments, snapshot.phrase, snapshot.content, progress).let { it.file to it.content.fingerprint }
     }
     // The repository mutex protects blobs from deletion; the metadata transaction has already ended.
-    private suspend fun encrypt(v: Vault, snapshot: Snapshot, progress: (String) -> Unit): PreparedBackup {
+    private suspend fun encrypt(v: Vault, manifest: ByteArray, attachments: List<AttachmentRow>, phrase: String, content: BackupInspection, progress: (String) -> Unit): PreparedBackup {
         val operation = currentCoroutineContext()
-        val password = snapshot.phrase.toCharArray()
+        val password = phrase.toCharArray()
         val output = File(cache, "${newId()}.ssnb")
         return try {
             checkAccess(); operation.ensureActive()
             output.outputStream().buffered().use { encrypted -> BackupCodec.encrypt(encrypted, password) { clear ->
                 val zip = ZipOutputStream(clear)
-                zip.putNextEntry(ZipEntry("manifest.json")); zip.write(snapshot.bytes); zip.closeEntry()
-                val attachments = snapshot.manifest.attachments
+                zip.putNextEntry(ZipEntry("manifest.json")); zip.write(manifest); zip.closeEntry()
                 attachments.forEachIndexed { index, a ->
                     checkAccess(); operation.ensureActive(); progress("Encrypting attachment ${index + 1} of ${attachments.size}")
                     zip.putNextEntry(ZipEntry("attachments/${a.id}"))
@@ -87,11 +138,14 @@ class BackupService(private val context: Context, private val repository: NotesR
                 zip.finish(); zip.flush()
             } }
             checkAccess(); operation.ensureActive()
-            PreparedBackup(output, snapshot.content, output.length(), output.inputStream().use(::ciphertextDigest))
+            PreparedBackup(output, content, output.length(), output.inputStream().use(::ciphertextDigest))
         } catch (e: Exception) { output.delete(); throw e }
         finally { password.fill('\u0000') }
     }
-    /** Restores a backup encrypted under [passphrase]; that passphrase becomes the restored vault's recovery passphrase. */
+    /**
+     * Restores a backup encrypted under [passphrase]; that passphrase becomes the restored vault's recovery passphrase.
+     * A version-4 index with attachments throws [AttachmentFolderNeeded] once authenticated; continue with [stageFolder].
+     */
     suspend fun stage(uri: Uri, passphrase: CharArray, progress: (String) -> Unit): Int = repository.access {
         val canonical = Passphrase.normalize(String(passphrase))
         val password = canonical.toCharArray()
@@ -101,6 +155,7 @@ class BackupService(private val context: Context, private val repository: NotesR
         val operation = currentCoroutineContext()
         discard()
         val staged = repository.staging()
+        var handedOff = false
         return try {
             var manifest: BackupManifest? = null
             context.contentResolver.openInputStream(uri)!!.buffered().use { encrypted ->
@@ -110,36 +165,84 @@ class BackupService(private val context: Context, private val repository: NotesR
                     val manifestBytes = readBounded(zip, MANIFEST_LIMIT)
                     val data = documentJson.decodeFromString<BackupManifest>(manifestBytes.toString(Charsets.UTF_8))
                     validate(data); manifest = data
-                    val requiredBytes = data.attachments.fold(0L) { total, attachment -> Math.addExact(total, attachment.size) }
-                    require(requiredBytes <= android.os.StatFs(staged.directory.absolutePath).availableBytes) { "Insufficient storage" }
-                    val expected = data.attachments.associateBy { it.id }
-                    val seen = mutableSetOf<String>()
-                    while (true) {
-                        checkAccess(); operation.ensureActive()
-                        val entry = zip.nextEntry ?: break
-                        require(entry.name.startsWith("attachments/")) { "Unexpected archive entry" }
-                        val id = entry.name.removePrefix("attachments/")
-                        val attachment = expected[id] ?: error("Unexpected attachment")
-                        require(seen.add(id)) { "Duplicate attachment" }
-                        progress("Validating attachment ${seen.size} of ${expected.size}")
-                        val (size, hash) = staged.write(id, zip, attachment.size) { operation.ensureActive() }
-                        require(size == attachment.size && hash == attachment.sha256) { "Attachment integrity failure" }
+                    if (data.version == 4) require(zip.nextEntry == null) { "Unexpected archive entry" }
+                    else {
+                        val requiredBytes = data.attachments.fold(0L) { total, attachment -> Math.addExact(total, attachment.size) }
+                        require(requiredBytes <= android.os.StatFs(staged.directory.absolutePath).availableBytes) { "Insufficient storage" }
+                        val expected = data.attachments.associateBy { it.id }
+                        val seen = mutableSetOf<String>()
+                        while (true) {
+                            checkAccess(); operation.ensureActive()
+                            val entry = zip.nextEntry ?: break
+                            require(entry.name.startsWith("attachments/")) { "Unexpected archive entry" }
+                            val id = entry.name.removePrefix("attachments/")
+                            val attachment = expected[id] ?: error("Unexpected attachment")
+                            require(seen.add(id)) { "Duplicate attachment" }
+                            progress("Validating attachment ${seen.size} of ${expected.size}")
+                            val (size, hash) = staged.write(id, zip, attachment.size) { operation.ensureActive() }
+                            require(size == attachment.size && hash == attachment.sha256) { "Attachment integrity failure" }
+                        }
+                        require(seen == expected.keys) { "Missing attachments" }
                     }
-                    require(seen == expected.keys) { "Missing attachments" }
                 }
             }
             val data = checkNotNull(manifest)
-            val validTags = data.tags.map { it.id }.toSet()
-            data.tags.forEach { staged.dao.insertTag(TagRow.of(it)) }
-            data.attachments.forEach { staged.dao.putAttachment(it.copy(indexed = false, nextPage = 0)) }
-            data.notes.forEach { repository.saveIn(staged, it, validTags) }
-            staged.setNoteOrder(data.orderedIds())
-            // Either confirmed device words or explicitly entered words decrypted this backup.
-            repository.setPassphrase(staged, canonical, confirmed = true)
-            checkAccess(); operation.ensureActive(); pending = staged
-            pendingCounts = Counts(data.notes.size, data.attachments.size, data.tags.size)
-            data.notes.size
+            if (data.version == 4) {
+                // Parsed only now, after the whole index has been authenticated.
+                BackupCodec.decodeKey(checkNotNull(data.attachmentKey)).fill(0)
+                if (data.attachments.isNotEmpty()) {
+                    staged.close(); staged.directory.deleteRecursively(); handedOff = true
+                    waiting = Waiting(data, canonical)
+                    throw AttachmentFolderNeeded(data.attachmentFolder)
+                }
+            }
+            publishStaged(staged, data, canonical)
+        } catch (e: Exception) { if (!handedOff) { staged.close(); staged.directory.deleteRecursively() }; throw e }
+    }
+    /**
+     * Stages the attachments of the index authenticated by [stage] from [folder]: the folder holding the recorded
+     * attachment directory, or that directory itself, wherever it now is. Identity comes from authentication, not names.
+     */
+    suspend fun stageFolder(folder: AttachmentFolder, progress: (String) -> Unit): Int = repository.access {
+        val operation = currentCoroutineContext()
+        val restoring = checkNotNull(waiting) { "No restore is waiting for attachments" }
+        val data = restoring.manifest
+        val names = checkNotNull(data.attachmentFiles)
+        val staged = repository.staging()
+        try {
+            val key = BackupCodec.decodeKey(checkNotNull(data.attachmentKey))
+            try {
+                val requiredBytes = data.attachments.fold(0L) { total, attachment -> Math.addExact(total, attachment.size) }
+                require(requiredBytes <= android.os.StatFs(staged.directory.absolutePath).availableBytes) { "Insufficient storage" }
+                val top = folder.list(null)
+                val directory = top.filter { it.directory && it.name == data.attachmentFolder }.singleOrNull()
+                val entries = (if (directory != null) folder.list(directory) else top).filter { !it.directory }
+                data.attachments.forEachIndexed { index, attachment ->
+                    checkAccess(); operation.ensureActive()
+                    progress("Validating attachment ${index + 1} of ${data.attachments.size}")
+                    val entry = attachmentEntry(entries, attachment.id, names.getValue(attachment.id)) ?: throw FileNotFoundException("Missing attachment")
+                    folder.open(entry).buffered().use { input ->
+                        AttachmentCodec.decrypt(input, key, attachment.id) { clear ->
+                            val (size, hash) = staged.write(attachment.id, clear, attachment.size) { operation.ensureActive() }
+                            require(size == attachment.size && hash == attachment.sha256) { "Attachment integrity failure" }
+                        }
+                    }
+                }
+            } finally { key.fill(0) }
+            publishStaged(staged, data, restoring.phrase).also { waiting = null }
         } catch (e: Exception) { staged.close(); staged.directory.deleteRecursively(); throw e }
+    }
+    private suspend fun publishStaged(staged: Vault, data: BackupManifest, canonical: String): Int {
+        val validTags = data.tags.map { it.id }.toSet()
+        data.tags.forEach { staged.dao.insertTag(TagRow.of(it)) }
+        data.attachments.forEach { staged.dao.putAttachment(it.copy(indexed = false, nextPage = 0)) }
+        data.notes.forEach { repository.saveIn(staged, it, validTags) }
+        staged.setNoteOrder(data.orderedIds())
+        // Either confirmed device words or explicitly entered words decrypted this backup.
+        repository.setPassphrase(staged, canonical, confirmed = true)
+        checkAccess(); currentCoroutineContext().ensureActive(); pending = staged
+        pendingCounts = Counts(data.notes.size, data.attachments.size, data.tags.size)
+        return data.notes.size
     }
     suspend fun commit() {
         val hash = repository.access { phraseHash(checkNotNull(checkNotNull(pending).passphrase())) }
@@ -148,7 +251,9 @@ class BackupService(private val context: Context, private val repository: NotesR
             pending = null; pendingCounts = null
             try {
                 beginWrite()
-                VaultBackupSettings.write(staged, configuration ?: VaultBackupSettings.read(current).afterRestore(hash))
+                val next = configuration ?: VaultBackupSettings.read(current).afterRestore(hash)
+                VaultBackupSettings.write(staged, next)
+                next.pairTag?.let { VaultBackupSettings.copyPair(current, staged, it) }
                 repository.activate(staged)
             } catch (e: Exception) {
                 if (repository.vault !== staged) { staged.close(); staged.directory.deleteRecursively() }
@@ -158,7 +263,7 @@ class BackupService(private val context: Context, private val repository: NotesR
         val coordinator = coordinator
         if (coordinator != null) coordinator.publishRestore(hash) { config, begin -> publish(config, begin) } else publish(null)
     }
-    fun discard() { pending?.let { it.close(); it.directory.deleteRecursively() }; pending = null; pendingCounts = null }
+    fun discard() { pending?.let { it.close(); it.directory.deleteRecursively() }; pending = null; pendingCounts = null; waiting = null }
     fun copyChecked(input: InputStream, output: OutputStream, checkpoint: () -> Unit = {}) {
         val buffer = ByteArray(64 * 1024)
         try { while (true) { checkAccess(); checkpoint(); val count = input.read(buffer); if (count < 0) break; output.write(buffer, 0, count) } }
@@ -174,9 +279,33 @@ class BackupService(private val context: Context, private val repository: NotesR
             while (true) { val count = input.read(buffer); if (count < 0) break; require(out.size() + count <= limit) { "Manifest too large" }; out.write(buffer, 0, count) }
             return out.toByteArray()
         }
+        /** A single path component a provider can show; names of one manifest must not collide ignoring case. */
+        fun safeName(name: String) = name.isNotBlank() && name.length <= 255 && name != "." && name != ".." && name.none { it == '/' || it == '\\' || it == '\u0000' }
+        /** The mapped name must match exactly one file; failing that, one file whose name starts with the ID. */
+        fun attachmentEntry(entries: List<AttachmentFolder.Entry>, id: String, name: String): AttachmentFolder.Entry? {
+            val named = entries.filter { it.name == name }
+            if (named.isNotEmpty()) return named.singleOrNull()
+            return entries.filter { it.name.startsWith(id) }.singleOrNull()
+        }
+        /** The serialized version-4 index for [content]; the size limit applies to all of it, including the new fields. */
+        fun indexBytes(content: BackupManifest, key: ByteArray, folder: String?, files: Map<String, String>, revision: Long): ByteArray {
+            val manifest = content.copy(version = 4, attachmentKey = BackupCodec.encodeKey(key), attachmentFolder = folder, attachmentFiles = files)
+            validateAttachmentFiles(manifest)
+            return documentJson.encodeToString(manifest).toByteArray(Charsets.UTF_8).also { checkManifestSize(it.size, revision) }
+        }
+        fun validateAttachmentFiles(data: BackupManifest) {
+            require(!data.attachmentKey.isNullOrEmpty()) { "Missing attachment key" }
+            val files = requireNotNull(data.attachmentFiles) { "Missing attachment files" }
+            require(files.keys == data.attachments.map { it.id }.toSet()) { "Attachment files do not match" }
+            require(files.values.all(::safeName) && files.values.map { it.lowercase() }.distinct().size == files.size) { "Unsafe attachment file name" }
+            data.attachmentFolder?.let { require(safeName(it)) { "Unsafe attachment folder name" } }
+            if (data.attachments.isNotEmpty()) requireNotNull(data.attachmentFolder) { "Missing attachment folder" }
+        }
         fun validate(data: BackupManifest) {
-            require(data.version in 1..3)
+            require(data.version in 1..4)
             if (data.version < 3) require(data.tags.isEmpty() && data.notes.all { it.tagIds.isEmpty() })
+            if (data.version < 4) require(data.attachmentKey == null && data.attachmentFolder == null && data.attachmentFiles == null)
+            else validateAttachmentFiles(data)
             require(data.tags.map { it.id }.distinct().size == data.tags.size)
             require(data.tags.map { tagKey(it.name) }.distinct().size == data.tags.size)
             data.tags.forEach { require(validId(it.id) && it.name.isNotEmpty() && tagName(it.name) == it.name) }

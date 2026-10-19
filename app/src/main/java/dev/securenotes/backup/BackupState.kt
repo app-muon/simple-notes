@@ -8,16 +8,30 @@ import java.io.OutputStream
 import java.security.MessageDigest
 
 @Serializable enum class BackupMode { DISABLED, LEGACY, PAIR }
-@Serializable enum class BackupProblem { IO, ACCESS, MANIFEST_TOO_LARGE, PHRASE_MISSING, PHRASE_CHANGED, ACTIVE_DAMAGED, INVALID_CONFIGURATION, BUSY, RESTART_REQUIRED, SELECT_AGAIN }
+@Serializable enum class BackupProblem { IO, ACCESS, MANIFEST_TOO_LARGE, PHRASE_MISSING, PHRASE_CHANGED, ACTIVE_DAMAGED, INVALID_CONFIGURATION, BUSY, RESTART_REQUIRED, SELECT_AGAIN, ATTACHMENT_DAMAGED }
 @Serializable data class BackupError(val problem: BackupProblem, val step: String, val diagnostic: String = "", val revision: Long? = null)
 @Serializable data class BackupSlot(val uri: String, val name: String, val length: Long, val sha256: String, val nameConfirmed: Boolean = true)
+/** A pair's attachment directory, created when its first attachment is saved. Its name is always provider-confirmed. */
+@Serializable data class BackupFolder(val uri: String, val name: String)
+/**
+ * Device record of one attachment file in a pair: plaintext identity, document, and the expected ciphertext. Measurements
+ * are committed before the document is opened for writing; [complete] only after it was written and read back.
+ */
+@Serializable data class AttachmentFile(
+    val id: String, val size: Long, val sha256: String,
+    val uri: String, val name: String, val length: Long, val digest: String,
+    val complete: Boolean = false,
+)
 enum class BackupAdmission {
     ACCEPTED, BUSY, LOCKED, RESTART_REQUIRED, UNAVAILABLE, PHRASE_REVIEW_REQUIRED, SELECT_AGAIN, INELIGIBLE, FAILED;
     val accepted: Boolean get() = this == ACCEPTED
 }
-/** One atomic secret, deliberately excluded from the exported manifest. */
+/**
+ * One atomic secret, deliberately excluded from the exported manifest. Version 2 added [pairTag] and [attachmentFolder];
+ * version 1 records still load. A pair with a [pairTag] saves attachments once each; one without saves whole files.
+ */
 @Serializable data class BackupConfiguration(
-    val version: Int = 1,
+    val version: Int = 2,
     val mode: BackupMode = BackupMode.DISABLED,
     val folder: String? = null,
     val slots: List<BackupSlot> = emptyList(),
@@ -29,22 +43,27 @@ enum class BackupAdmission {
     val error: BackupError? = null,
     val legacyUri: String? = null,
     val legacyName: String? = null,
+    /** Keys the pair's attachment key and file records in device settings. */
+    val pairTag: String? = null,
+    val attachmentFolder: BackupFolder? = null,
 ) {
     fun validate() {
-        require(version == 1)
+        require(version in 1..2)
         when (mode) {
-            BackupMode.DISABLED -> require(slots.isEmpty() && folder == null && legacyUri == null)
-            BackupMode.LEGACY -> require(!legacyUri.isNullOrBlank() && slots.isEmpty())
+            BackupMode.DISABLED -> require(slots.isEmpty() && folder == null && legacyUri == null && pairTag == null && attachmentFolder == null)
+            BackupMode.LEGACY -> require(!legacyUri.isNullOrBlank() && slots.isEmpty() && pairTag == null && attachmentFolder == null)
             BackupMode.PAIR -> {
                 require(!folder.isNullOrBlank() && slots.size == 2 && active in 0..1)
                 require(slots.map { it.uri }.distinct().size == 2)
                 require(slots.all { it.uri.isNotBlank() && it.name.isNotBlank() && it.length > 0 && validDigest(it.sha256) })
                 require(validDigest(phraseHash) && validDigest(fingerprint))
+                pairTag?.let { require(dev.securenotes.document.validId(it)) }
+                attachmentFolder?.let { require(pairTag != null && it.uri.isNotBlank() && it.name.isNotBlank() && slots.none { slot -> slot.uri == it.uri }) }
             }
         }
     }
     val grant: String? get() = if (mode == BackupMode.LEGACY) legacyUri else folder
-    val managedUris: Set<String> get() = slots.map { it.uri }.toSet() + listOfNotNull(legacyUri)
+    val managedUris: Set<String> get() = slots.map { it.uri }.toSet() + listOfNotNull(legacyUri, attachmentFolder?.uri)
     fun afterRestore(restoredPhraseHash: String): BackupConfiguration {
         if (mode != BackupMode.PAIR) return this
         val nextError = if (phraseHash != restoredPhraseHash) BackupError(BackupProblem.PHRASE_CHANGED, "restore")
@@ -71,16 +90,36 @@ data class BackupInspection(val fingerprint: String, val phraseHash: String, val
 data class PreparedBackup(val file: File, val content: BackupInspection, val length: Long, val sha256: String) : Closeable {
     override fun close() { file.delete() }
 }
+/** An attachment's plaintext identity as captured in a snapshot. */
+data class BackupAttachment(val id: String, val size: Long, val sha256: String)
+/** Metadata captured once per save; [manifest] is the source's own content and is opaque to the coordinator. */
+class BackupSnapshot(val content: BackupInspection, val attachments: List<BackupAttachment>, val manifest: Any? = null)
+/** An attachment of the captured snapshot was removed or replaced meanwhile; a later attempt captures current metadata. */
+class SnapshotChanged : Exception()
 interface BackupSource {
     val revision: Long
     suspend fun inspect(): BackupInspection
+    /** A whole version-3 file, for pairs created before attachments were saved separately. */
     suspend fun prepare(progress: (String) -> Unit): PreparedBackup
+    suspend fun capture(progress: (String) -> Unit): BackupSnapshot
+    /** Encrypts one attachment of [snapshot] under the pair's key, checking its plaintext length and SHA-256. */
+    suspend fun prepareAttachment(snapshot: BackupSnapshot, attachment: BackupAttachment, key: ByteArray): PreparedBackup
+    /** A version-4 index naming [files] (attachment ID to actual filename) in [folder]. */
+    suspend fun prepareIndex(snapshot: BackupSnapshot, key: ByteArray, folder: String?, files: Map<String, String>): PreparedBackup
 }
 interface BackupSettingsStore {
     suspend fun load(): BackupConfiguration
     /** Call [beginWrite] after session/access checks, immediately before the atomic write. */
     suspend fun save(configuration: BackupConfiguration, beginWrite: () -> Unit)
+    suspend fun key(pairTag: String): ByteArray?
+    suspend fun saveKey(pairTag: String, key: ByteArray, beginWrite: () -> Unit)
+    suspend fun files(pairTag: String): Map<String, AttachmentFile>
+    suspend fun saveFile(pairTag: String, file: AttachmentFile, beginWrite: () -> Unit)
+    /** Removes a pair's key and file records; its files stay where they are. */
+    suspend fun forget(pairTag: String)
 }
+/** A direct child of a backup directory; [size] is null when the provider does not report one. */
+data class BackupChild(val uri: String, val name: String, val size: Long?)
 data class BackupDocument(val uri: String, val name: String, val nameConfirmed: Boolean = true)
 interface BackupOutput : Closeable {
     val stream: OutputStream
@@ -92,7 +131,12 @@ interface BackupFiles {
     fun hasAnyGrant(folder: String): Boolean = hasGrant(folder)
     fun retain(folder: String)
     fun release(folder: String)
+    /** Creates a document in [folder], a granted tree or a directory created under one. */
     fun create(folder: String, name: String): String
+    fun createDirectory(folder: String, name: String): String
+    fun children(directory: String): List<BackupChild>
+    /** The document's size from its own descriptor; null when unknown. Throws FileNotFoundException when it is missing. */
+    fun measure(uri: String): Long?
     fun displayName(uri: String): String?
     fun delete(uri: String)
     fun openWrite(uri: String, mode: String): BackupOutput

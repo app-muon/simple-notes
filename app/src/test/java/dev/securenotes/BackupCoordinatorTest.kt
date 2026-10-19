@@ -31,21 +31,48 @@ class BackupCoordinatorTest {
         var failure: Exception? = null
         var onPrepare: suspend () -> Unit = {}
         var afterSnapshot: suspend (BackupInspection) -> Unit = {}
+        var onAttachment: suspend (String) -> Unit = {}
         var prepares = 0
+        var wholePrepares = 0
         var inspections = 0
         val artifacts = mutableListOf<File>()
+        /** Attachment ID to content, in note order. */
+        val attachments = linkedMapOf<String, ByteArray>()
+        /** IDs in the order their files were encrypted. */
+        val encrypted = mutableListOf<String>()
+        /** The attachment filenames each prepared index named. */
+        val indexes = mutableListOf<Map<String, String>>()
         override suspend fun inspect(): BackupInspection {
             inspections++
             failure?.let { throw it }
             return BackupInspection(revision.toString().padStart(64, '0'), phrase, revision, empty)
         }
+        private fun artifact(text: String, content: BackupInspection): PreparedBackup {
+            val file = File(directory, "artifact-${artifacts.size}").apply { writeText(text) }
+            artifacts += file
+            return PreparedBackup(file, content, file.length(), file.inputStream().use(::ciphertextDigest))
+        }
         override suspend fun prepare(progress: (String) -> Unit): PreparedBackup {
+            wholePrepares++
+            val content = inspect()
+            return artifact("whole $wholePrepares revision ${content.revision}", content)
+        }
+        override suspend fun capture(progress: (String) -> Unit): BackupSnapshot {
             prepares++; onPrepare()
             val content = inspect()
             afterSnapshot(content)
-            val file = File(directory, "artifact-$prepares").apply { writeText("ciphertext $prepares revision ${content.revision}") }
-            artifacts += file
-            return PreparedBackup(file, content, file.length(), file.inputStream().use(::ciphertextDigest))
+            return BackupSnapshot(content, attachments.map { (id, bytes) -> BackupAttachment(id, bytes.size.toLong(), sha(bytes)) })
+        }
+        override suspend fun prepareAttachment(snapshot: BackupSnapshot, attachment: BackupAttachment, key: ByteArray): PreparedBackup {
+            onAttachment(attachment.id)
+            val bytes = attachments[attachment.id]?.takeIf { sha(it) == attachment.sha256 } ?: throw SnapshotChanged()
+            encrypted += attachment.id
+            // Each encryption differs, as Tink's fresh randomness makes it.
+            return artifact("attachment ${attachment.id} ${encrypted.size} ${bytes.decodeToString()}", snapshot.content)
+        }
+        override suspend fun prepareIndex(snapshot: BackupSnapshot, key: ByteArray, folder: String?, files: Map<String, String>): PreparedBackup {
+            indexes += files
+            return artifact("ciphertext $prepares folder $folder files $files revision ${snapshot.content.revision}", snapshot.content)
         }
     }
     private class FakeSettings(val unlocked: () -> Boolean) : BackupSettingsStore {
@@ -53,6 +80,11 @@ class BackupCoordinatorTest {
         var writes = 0
         var failWrite: Int? = null
         var applyBeforeFailure = false
+        val keys = mutableMapOf<String, ByteArray>()
+        val files = mutableMapOf<String, MutableMap<String, AttachmentFile>>()
+        var recordWrites = 0
+        var failRecord: Int? = null
+        var applyRecordBeforeFailure = false
         override suspend fun load() = record
         override suspend fun save(configuration: BackupConfiguration, beginWrite: () -> Unit) {
             if (!unlocked()) throw CancellationException()
@@ -62,6 +94,23 @@ class BackupCoordinatorTest {
                 throw IOException("private path that must never be displayed")
             }
             record = configuration
+        }
+        private fun commit(beginWrite: () -> Unit, apply: () -> Unit) {
+            if (!unlocked()) throw CancellationException()
+            beginWrite(); recordWrites++
+            if (recordWrites == failRecord) {
+                if (applyRecordBeforeFailure) apply()
+                throw IOException("private")
+            }
+            apply()
+        }
+        override suspend fun key(pairTag: String) = keys[pairTag]?.copyOf()
+        override suspend fun saveKey(pairTag: String, key: ByteArray, beginWrite: () -> Unit) = commit(beginWrite) { keys[pairTag] = key.copyOf() }
+        override suspend fun files(pairTag: String): Map<String, AttachmentFile> = files[pairTag].orEmpty().toMap()
+        override suspend fun saveFile(pairTag: String, file: AttachmentFile, beginWrite: () -> Unit) = commit(beginWrite) { files.getOrPut(pairTag) { mutableMapOf() }[file.id] = file }
+        override suspend fun forget(pairTag: String) {
+            if (!unlocked()) throw CancellationException()
+            keys.remove(pairTag); files.remove(pairTag)
         }
     }
     private class FakeFiles : BackupFiles {
@@ -82,6 +131,13 @@ class BackupCoordinatorTest {
         var nameFailure: Exception? = null
         var openFailure: Exception? = null
         var readFailure: Exception? = null
+        val directories = mutableSetOf<String>()
+        var listFailure: Exception? = null
+        /** Present files a listing omits, and sizes a listing or descriptor reports instead of the real one. */
+        val hidden = mutableSetOf<String>()
+        val listedSizes = mutableMapOf<String, Long?>()
+        val measuredSizes = mutableMapOf<String, Long?>()
+        var measureFailure: Exception? = null
         private val names = mutableMapOf<String, String>()
         override fun hasGrant(folder: String): Boolean { grantChecks++; onGrant(); return folder in grants }
         override fun retain(folder: String) { grants += folder; events += "retain:$folder" }
@@ -93,13 +149,35 @@ class BackupCoordinatorTest {
             names[uri] = name + collisionSuffix
             return uri
         }
+        override fun createDirectory(folder: String, name: String): String {
+            onCreate()
+            val uri = "$folder/${++counter}"
+            directories += uri; names[uri] = name + collisionSuffix
+            events += "mkdir:$uri"
+            return uri
+        }
+        override fun children(directory: String): List<BackupChild> {
+            events += "list:$directory"
+            listFailure?.let { throw it }
+            return data.keys.filter { it.startsWith("$directory/") && '/' !in it.removePrefix("$directory/") && it !in hidden }
+                .map { BackupChild(it, names[it] ?: "", if (it in listedSizes) listedSizes[it] else data.getValue(it).size.toLong()) }
+        }
+        override fun measure(uri: String): Long? {
+            events += "measure:$uri"
+            measureFailure?.let { throw it }
+            val bytes = data[uri] ?: throw FileNotFoundException()
+            return if (uri in measuredSizes) measuredSizes[uri] else bytes.size.toLong()
+        }
         override fun displayName(uri: String): String? { nameFailure?.let { throw it }; return if (missingName) name else names[uri] }
-        override fun delete(uri: String) { events += "delete:$uri"; data.remove(uri) }
+        override fun delete(uri: String) {
+            events += "delete:$uri"; data.remove(uri)
+            if (directories.remove(uri)) data.keys.removeAll { it.startsWith("$uri/") }
+        }
         override fun openRead(uri: String): InputStream {
             events += "read:$uri"
             readFailure?.let { throw it }
             if (failure == "read" || failure == "read:$uri") throw IOException()
-            return checkNotNull(data[uri]).inputStream()
+            return (data[uri] ?: throw FileNotFoundException()).inputStream()
         }
         override fun openWrite(uri: String, mode: String): BackupOutput {
             events += "open:$uri:$mode"
@@ -676,5 +754,222 @@ class BackupCoordinatorTest {
         assertEquals(R.string.backup_io, dev.securenotes.ui.backupErrorResource(BackupError(BackupProblem.IO, "write-rwt")))
         assertEquals(R.string.backup_setup_io, dev.securenotes.ui.backupErrorResource(BackupError(BackupProblem.IO, "write-rwt"), setup = true))
         assertEquals(R.string.backup_setup_io, dev.securenotes.ui.backupErrorResource(BackupError(BackupProblem.ACTIVE_DAMAGED, "verify"), setup = true))
+        assertEquals(R.string.backup_attachments_unverified, dev.securenotes.ui.backupErrorResource(BackupError(BackupProblem.IO, "check-attachments")))
+        assertEquals(R.string.backup_attachments_access, dev.securenotes.ui.backupErrorResource(BackupError(BackupProblem.ACCESS, "check-attachments")))
+        assertEquals(R.string.backup_attachment_damaged, dev.securenotes.ui.backupErrorResource(BackupError(BackupProblem.ATTACHMENT_DAMAGED, "check-attachments")))
+        assertEquals(R.string.backup_attachment_conflict, dev.securenotes.ui.backupErrorResource(BackupError(BackupProblem.ATTACHMENT_DAMAGED, "attachment-identity")))
+    }
+
+    private fun Fixture.saved(): Map<String, AttachmentFile> = settings.files.getValue(checkNotNull(settings.record.pairTag))
+    /** Events that touch an attachment file itself; listing its folder does not. */
+    private fun Fixture.attachmentEvents(): List<String> {
+        val uris = saved().values.map { it.uri }
+        return files.events.filter { event -> uris.any { uri -> event.substringAfter(':').let { it == uri || it.startsWith("$uri:") } } }
+    }
+    @Test fun `setup saves attachments once in a confirmed folder before both indexes`() = runTest {
+        val f = fixture(); f.files.collisionSuffix = " (2)"
+        f.source.attachments[id(1)] = "first".toByteArray(); f.source.attachments[id(2)] = "second".toByteArray()
+        f.setup()
+        val config = f.settings.record
+        val folder = checkNotNull(config.attachmentFolder)
+        assertEquals("Notes-19700102T101736789Z-attachments (2)", folder.name)
+        assertEquals(listOf(id(1), id(2)), f.source.encrypted)
+        val saved = f.saved()
+        assertTrue(saved.values.all { it.complete && it.uri.startsWith("${folder.uri}/") && it.name == "${it.id}.ssna (2)" })
+        saved.values.forEach { assertEquals(it.digest, f.files.data.getValue(it.uri).inputStream().use(::ciphertextDigest)) }
+        assertEquals(mapOf(id(1) to "${id(1)}.ssna (2)", id(2) to "${id(2)}.ssna (2)"), f.source.indexes.single())
+        assertEquals(config.slots.map { f.files.data.getValue(it.uri).decodeToString() }.distinct().size, 1)
+        assertNotNull(f.settings.key(checkNotNull(config.pairTag)))
+        assertTrue(folder.uri in config.managedUris)
+    }
+    @Test fun `text edits reordering and removal never reopen saved attachments`() = runTest {
+        val f = fixture()
+        f.source.attachments[id(1)] = "first".toByteArray(); f.source.attachments[id(2)] = "second".toByteArray()
+        f.setup()
+        val folder = checkNotNull(f.settings.record.attachmentFolder).uri
+        val ciphertext = f.saved().values.associate { it.uri to f.files.data.getValue(it.uri).clone() }
+        fun indexWrites() = f.files.events.count { it.startsWith("open:") && f.settings.record.slots.any { slot -> it.startsWith("open:${slot.uri}:") } }
+        // A text edit: one directory query, one index write, and no attachment file read, measured or written.
+        f.source.revision++; f.backup.run()
+        assertEquals(listOf("list:$folder"), f.files.events.filter { it.startsWith("list:") })
+        assertTrue(f.attachmentEvents().isEmpty()); assertEquals(1, indexWrites())
+        assertEquals(1, f.files.events.count { it.startsWith("open:") })
+        // Reordering only changes the index.
+        f.files.events.clear()
+        val reordered = f.source.attachments.entries.reversed().associate { it.key to it.value }
+        f.source.attachments.clear(); f.source.attachments.putAll(reordered); f.source.revision++; f.backup.run()
+        assertTrue(f.attachmentEvents().isEmpty()); assertEquals(1, f.files.events.count { it.startsWith("open:") })
+        // Adding one attachment writes only that file and one index.
+        f.files.events.clear(); f.source.attachments[id(3)] = "third".toByteArray(); f.source.revision++; f.backup.run()
+        val added = f.saved().getValue(id(3))
+        assertTrue(added.complete)
+        assertEquals(listOf("open:${added.uri}:rwt"), f.files.events.filter { it.startsWith("open:") && !it.startsWith("open:${f.settings.record.slots[0].uri}") && !it.startsWith("open:${f.settings.record.slots[1].uri}") })
+        assertEquals(2, f.files.events.count { it.startsWith("open:") })
+        assertEquals(listOf(id(1), id(2), id(3)), f.source.encrypted)
+        // Removal deletes no file; the index names only current attachments.
+        f.files.events.clear(); f.source.attachments.remove(id(1)); f.source.revision++; f.backup.run()
+        assertTrue(f.files.events.none { it.startsWith("delete:") }); assertEquals(1, f.files.events.count { it.startsWith("open:") })
+        assertEquals(setOf(id(2), id(3)), f.source.indexes.last().keys)
+        ciphertext.forEach { (uri, bytes) -> assertArrayEquals(bytes, f.files.data[uri]) }
+        // An unchanged automatic save writes nothing; a forced save still writes the index, and only the index.
+        f.files.events.clear(); f.backup.run(); assertTrue(f.files.events.isEmpty())
+        f.backup.run(force = true)
+        assertTrue(f.attachmentEvents().isEmpty()); assertEquals(1, f.files.events.count { it.startsWith("open:") })
+        assertNull(f.settings.record.error)
+    }
+    @Test fun `attachment damage needs two signals and no check outcome opens an index`() = runTest {
+        val cases = listOf<Triple<String, BackupProblem, (FakeFiles, AttachmentFile) -> Unit>>(
+            Triple("missing", BackupProblem.ATTACHMENT_DAMAGED) { files, file -> files.data.remove(file.uri) },
+            Triple("wrong size", BackupProblem.ATTACHMENT_DAMAGED) { files, file -> files.data[file.uri] = files.data.getValue(file.uri) + 1 },
+            Triple("listing fails", BackupProblem.IO) { files, _ -> files.listFailure = IOException("private") },
+            Triple("listing denied", BackupProblem.ACCESS) { files, _ -> files.listFailure = SecurityException("private") },
+            Triple("unknown listed size", BackupProblem.IO) { files, file -> files.listedSizes[file.uri] = null },
+            Triple("listing omits a present file", BackupProblem.IO) { files, file -> files.hidden += file.uri },
+            Triple("descriptor disagrees with listing", BackupProblem.IO) { files, file -> files.listedSizes[file.uri] = 1 },
+            Triple("descriptor size unknown", BackupProblem.IO) { files, file -> files.listedSizes[file.uri] = 1; files.measuredSizes[file.uri] = null },
+            Triple("listed but not found on open", BackupProblem.IO) { files, file -> files.listedSizes[file.uri] = 1; files.measureFailure = FileNotFoundException() },
+            Triple("listing omits and descriptor denied", BackupProblem.ACCESS) { files, file -> files.hidden += file.uri; files.measureFailure = SecurityException() },
+        )
+        for ((name, expected, arrange) in cases) {
+            val f = fixture(); f.source.attachments[id(1)] = "first".toByteArray(); f.setup()
+            arrange(f.files, f.saved().getValue(id(1)))
+            f.source.revision++; f.backup.run()
+            assertEquals(name, expected, f.settings.record.error?.problem)
+            assertEquals(name, "check-attachments", f.settings.record.error?.step)
+            assertTrue(name, f.files.events.none { it.startsWith("open:") })
+            assertEquals(name, 1, f.source.prepares)
+            if (expected == BackupProblem.ATTACHMENT_DAMAGED) assertFalse(name, f.backup.mayWrite(force = true))
+            if (expected == BackupProblem.IO) {
+                // Unverified stays retryable and recovers once the provider answers consistently.
+                f.files.listFailure = null; f.files.hidden.clear(); f.files.listedSizes.clear(); f.files.measuredSizes.clear(); f.files.measureFailure = null
+                f.backup.run(); assertNull(name, f.settings.record.error)
+            }
+        }
+    }
+    @Test fun `unfinished attachments commit fresh measurements before any rewrite`() = runTest {
+        val f = fixture(); f.setup()
+        f.source.attachments[id(1)] = "first".toByteArray(); f.source.revision++
+        f.files.failure = "write"; f.backup.run()
+        val first = f.saved().getValue(id(1))
+        assertFalse(first.complete); assertEquals(BackupProblem.IO, f.settings.record.error?.problem)
+        assertTrue(f.settings.record.slots.none { slot -> f.files.events.any { it.startsWith("open:${slot.uri}:") } })
+        f.files.failure = null
+        // Locked before the measurements commit: nothing is reopened and nothing needs a restart.
+        f.files.events.clear(); f.source.onAttachment = { f.unlocked = false }
+        try { f.backup.run(force = true) } catch (_: CancellationException) { }
+        assertTrue(f.attachmentEvents().none { it.startsWith("open:") }); assertEquals(first, f.saved().getValue(id(1)))
+        f.source.onAttachment = {}; f.unlocked = true; f.backup.refresh(); assertFalse(f.backup.status.value!!.restartRequired)
+        // A failed commit with an uncertain outcome never reopens the document and blocks until restart.
+        for (applied in listOf(false, true)) {
+            f.files.events.clear()
+            f.settings.failRecord = f.settings.recordWrites + 1; f.settings.applyRecordBeforeFailure = applied
+            f.backup.run(force = true)
+            assertTrue(applied.toString(), f.attachmentEvents().none { it.startsWith("open:") })
+            assertTrue(f.backup.status.value!!.restartRequired)
+            f.settings.failRecord = null; f.restart()
+        }
+        // Measurements committed for an encryption that was never written: the next attempt re-encrypts, commits
+        // fresh measurements and rewrites the same document exactly once.
+        f.settings.files.getValue(checkNotNull(f.settings.record.pairTag))[id(1)] = first.copy(length = 99, digest = "e".repeat(64))
+        f.restart(); f.files.events.clear()
+        f.backup.run(force = true)
+        val finished = f.saved().getValue(id(1))
+        assertTrue(finished.complete); assertEquals(first.uri, finished.uri)
+        assertNotEquals("e".repeat(64), finished.digest); assertNotEquals(first.digest, finished.digest)
+        assertEquals(1, f.files.events.count { it.startsWith("open:${first.uri}:") })
+        assertEquals(finished.digest, f.files.data.getValue(first.uri).inputStream().use(::ciphertextDigest))
+        assertNull(f.settings.record.error)
+        // A completed attachment is never reopened, even by a forced save.
+        f.files.events.clear(); f.backup.run(force = true)
+        assertTrue(f.attachmentEvents().none { it.startsWith("open:") || it.startsWith("read:") })
+    }
+    @Test fun `a written but unrecorded attachment completes without rewriting and a lost one gets a new document`() = runTest {
+        for (lost in listOf(false, true)) {
+            val f = fixture(); f.setup()
+            f.source.attachments[id(1)] = "first".toByteArray(); f.source.revision++
+            // The file is written and read back, but recording its completion has an uncertain outcome.
+            f.settings.failRecord = f.settings.recordWrites + 2
+            f.backup.run(); assertTrue(f.backup.status.value!!.restartRequired)
+            f.settings.failRecord = null; f.restart()
+            val unfinished = f.saved().getValue(id(1))
+            assertFalse(unfinished.complete)
+            assertEquals(unfinished.digest, f.files.data.getValue(unfinished.uri).inputStream().use(::ciphertextDigest))
+            if (lost) f.files.data.remove(unfinished.uri)
+            f.files.events.clear(); f.backup.run(force = true)
+            val finished = f.saved().getValue(id(1))
+            assertTrue(finished.complete); assertNull(f.settings.record.error)
+            if (lost) {
+                assertNotEquals(unfinished.uri, finished.uri)
+                assertEquals(1, f.files.events.count { it.startsWith("open:${finished.uri}:") })
+            } else {
+                assertEquals(unfinished.copy(complete = true), finished)
+                assertTrue(f.files.events.none { it.startsWith("open:${unfinished.uri}:") })
+            }
+            assertEquals(mapOf(id(1) to finished.name), f.source.indexes.last())
+        }
+    }
+    @Test fun `an attachment ID with other content pauses the pair without writing`() = runTest {
+        val f = fixture(); f.source.attachments[id(1)] = "first".toByteArray(); f.setup()
+        f.source.attachments[id(1)] = "other".toByteArray(); f.source.revision++; f.backup.run(force = true)
+        assertEquals(BackupError(BackupProblem.ATTACHMENT_DAMAGED, "attachment-identity", "BackupFailure"), f.settings.record.error)
+        assertTrue(f.files.events.none { it.startsWith("open:") }); assertFalse(f.backup.mayWrite(force = true))
+        f.backup.publishRestore(f.source.phrase) { config, begin -> begin(); f.settings.record = config }
+        assertEquals(BackupProblem.ATTACHMENT_DAMAGED, f.settings.record.error?.problem)
+    }
+    @Test fun `the attachment folder is created with the first attachment and a removed source abandons the snapshot`() = runTest {
+        val f = fixture(); f.setup()
+        assertNull(f.settings.record.attachmentFolder); assertTrue(f.files.directories.isEmpty())
+        f.source.attachments[id(1)] = "first".toByteArray(); f.source.revision++
+        f.source.onAttachment = { f.source.attachments.clear() }
+        f.backup.run()
+        assertNull(f.settings.record.error); assertTrue(f.settings.record.slots.none { slot -> f.files.events.any { it.startsWith("open:${slot.uri}:") } })
+        assertNotNull(f.settings.record.attachmentFolder)
+        f.source.onAttachment = {}; f.source.attachments[id(1)] = "first".toByteArray(); f.source.revision++; f.files.events.clear()
+        f.backup.run()
+        assertEquals(1, f.files.directories.size); assertTrue(f.saved().getValue(id(1)).complete)
+        assertTrue(f.files.events.none { it.startsWith("mkdir:") }); assertNull(f.settings.record.error)
+    }
+    @Test fun `setup failures remove the folder files key and records they created`() = runTest {
+        for (failure in listOf("write", "name")) {
+            val f = fixture(); f.source.attachments[id(1)] = "first".toByteArray(); f.setup()
+            val old = f.settings.record; val data = f.files.data.keys.toSet(); val directories = f.files.directories.toSet()
+            f.source.attachments[id(2)] = "second".toByteArray()
+            if (failure == "write") f.files.failure = "write" else { f.files.missingName = true; f.files.name = null }
+            assertEquals(BackupAdmission.FAILED, f.backup.choose("folder"))
+            assertEquals(data, f.files.data.keys); assertEquals(directories, f.files.directories)
+            assertEquals(old, f.settings.record)
+            assertEquals(setOf(old.pairTag), f.settings.keys.keys); assertEquals(setOf(old.pairTag), f.settings.files.keys)
+        }
+    }
+    @Test fun `a new pair forgets the old pair's records but keeps its files`() = runTest {
+        val f = fixture(); f.source.attachments[id(1)] = "first".toByteArray(); f.setup()
+        val old = f.settings.record; val oldFile = f.saved().getValue(id(1))
+        assertTrue(f.backup.choose("folder").accepted)
+        val next = f.settings.record
+        assertNotEquals(old.pairTag, next.pairTag); assertNotEquals(old.attachmentFolder, next.attachmentFolder)
+        assertEquals(setOf(next.pairTag), f.settings.keys.keys); assertEquals(setOf(next.pairTag), f.settings.files.keys)
+        assertTrue(oldFile.uri in f.files.data); assertNotEquals(oldFile.uri, f.saved().getValue(id(1)).uri)
+        f.backup.turnOff()
+        assertTrue(f.settings.keys.isEmpty()); assertTrue(f.settings.files.isEmpty()); assertTrue(oldFile.uri in f.files.data)
+    }
+    @Test fun `pairs from before attachment files keep whole-file saves`() = runTest {
+        val f = fixture(); f.source.attachments[id(1)] = "first".toByteArray(); f.setup()
+        f.settings.record = f.settings.record.copy(pairTag = null, attachmentFolder = null); f.settings.keys.clear(); f.settings.files.clear()
+        f.restart(); f.files.events.clear(); f.source.revision++; f.backup.run()
+        assertEquals(1, f.source.wholePrepares); assertTrue(f.files.events.none { it.startsWith("list:") || it.startsWith("mkdir:") })
+        assertTrue(f.files.data.getValue(f.settings.record.slots[f.settings.record.active].uri).decodeToString().startsWith("whole"))
+        assertNull(f.settings.record.pairTag); assertNull(f.settings.record.error)
+    }
+    @Test fun `configuration version 1 records still load and validate`() {
+        val decoded = dev.securenotes.document.documentJson.decodeFromString<BackupConfiguration>(
+            """{"version":1,"mode":"PAIR","folder":"folder","slots":[{"uri":"a","name":"A","length":1,"sha256":"${"a".repeat(64)}"},{"uri":"b","name":"B","length":1,"sha256":"${"b".repeat(64)}"}],"active":1,"phraseHash":"${"c".repeat(64)}","fingerprint":"${"d".repeat(64)}","savedAt":1,"pending":false,"error":null,"legacyUri":null,"legacyName":null}""")
+        decoded.validate(); assertNull(decoded.pairTag); assertNull(decoded.attachmentFolder)
+        assertThrows(IllegalArgumentException::class.java) { decoded.copy(version = 3).validate() }
+        assertThrows(IllegalArgumentException::class.java) { decoded.copy(attachmentFolder = BackupFolder("f", "F")).validate() }
+        assertThrows(IllegalArgumentException::class.java) { decoded.copy(pairTag = "not a uuid").validate() }
+        assertThrows(IllegalArgumentException::class.java) { BackupConfiguration(pairTag = id(1)).validate() }
     }
 }
+
+private fun sha(bytes: ByteArray) = java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+private fun id(n: Int) = java.util.UUID(0, n.toLong()).toString()

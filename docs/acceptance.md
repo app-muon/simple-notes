@@ -58,5 +58,13 @@ External file viewers and Android file-provider/camera applications can behave d
 - Terminate the process during inactive copying and before final metadata recording. Restart and verify the old active copy, durable pending work, and a successful retry.
 - Test lock during metadata preparation and ciphertext writing; balance service holds on cancellation and timeout.
 - Stage restore, then change/disable the destination before confirming. Confirm latest configuration is transferred. Restore another phrase and verify review plus a new pair is required.
+
+## Attachment file checks
+
+- With Autosync in upload-only mode, confirm uploads include the attachments subfolder. Add 20 photos and save; then edit only text and confirm that only one index file changes (modified times and the sync app's log). Add one photo and confirm exactly one new `.ssna` plus one index. Remove a photo and confirm its file stays.
+- Measure an initial setup, an interrupted and resumed save, and a text-only save with a photo-heavy collection. Leave the app during a large first save, let the service time limit pass, and confirm the next save continues without rewriting completed files.
+- Delete or truncate one `.ssna` in phone storage and confirm the next save reports damage without writing either index; revoke folder access and confirm it reports the files as unverified instead.
+- Download the whole folder to a fresh device or emulator and restore each of A and B with only the phrase. Choose the parent folder, the attachments folder itself, a renamed copy and a wrong folder; cancel the folder picker; lock while validating. Current notes must stay intact until replacement is confirmed. Restore a partially synced copy and confirm it is rejected.
+- Upgrade the app over an existing whole-file pair: it keeps saving whole files and Settings suggests a new pair. Create one in the same folder and confirm the old files remain.
 - Exercise missing phrases, active-file corruption, stale provider read-back, lost grants, full storage, uncertain settings commits, setup cancellation, and same-folder reselection.
 - Record local verification and external upload as separate acceptance results. A local pass never establishes that the sync provider uploaded either file.

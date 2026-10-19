@@ -165,6 +165,7 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
     }
     val backupPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree(), vm::chooseBackup)
     val restorePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument(), vm::selectRestore)
+    val restoreFolderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree(), vm::selectRestoreFolder)
     val chooseRestore = { restorePicker.launch(arrayOf("*/*")) }
     val chooseBackup = { if (vm.canChooseBackup()) { if (vm.app.autoBackup.setupNeedsReview()) reveal() else vm.launchBackupPicker { backupPicker.launch(null) } } }
     val backupStatus by vm.app.autoBackup.status.collectAsStateWithLifecycle()
@@ -215,6 +216,10 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
     if (vm.share != null && !vm.choosingDestination && vm.setupWords == null) AlertDialog(onDismissRequest = { vm.share = null }, title = { Text("Add shared content") }, text = { Text("Choose where to put the shared text or files.") }, confirmButton = { TextButton(onClick = { vm.acceptShare(null) }) { Text("New note") } }, dismissButton = { TextButton(onClick = { vm.choosingDestination = true; vm.screen = Screen.LIST; vm.query = "" }) { Text("Add to existing note") } })
     if (vm.passwordMode != null) PassphraseDialog(vm.wordlist, "Backup passphrase", "Enter the recovery passphrase of the phone that made this backup. It becomes this phone's recovery passphrase.", "Continue",
         { vm.passwordMode = null }, vm::submitPassword)
+    vm.restoreFolder?.let { folder -> AlertDialog(onDismissRequest = vm::cancelRestore, title = { Text(stringResource(R.string.restore_folder_title)) },
+        text = { Text(stringResource(R.string.restore_folder, folder)) },
+        confirmButton = { TextButton(onClick = { vm.chooseRestoreFolder { restoreFolderPicker.launch(null) } }) { Text(stringResource(R.string.restore_folder_choose)) } },
+        dismissButton = { TextButton(onClick = vm::cancelRestore) { Text("Cancel") } }) }
     vm.restoreCount?.let { count -> AlertDialog(onDismissRequest = vm::cancelRestore, title = { Text("Replace all notes?") }, text = { Text("This backup contains $count notes, ${vm.backups.pendingCounts?.attachments ?: 0} attachments, and ${vm.backups.pendingCounts?.tags ?: 0} tags. All current notes and attachments will be replaced. The phrase that opened this backup becomes your recovery phrase. This device's backup files and configuration are retained; a different phrase pauses backups until you review it and create a new pair. No safety backup will be created.") }, confirmButton = { TextButton(onClick = vm::restore) { Text("Replace everything") } }, dismissButton = { TextButton(onClick = vm::cancelRestore) { Text("Cancel") } }) }
     vm.busy?.let { message -> AlertDialog(onDismissRequest = {}, title = { Text(message) }, text = { LinearProgressIndicator(Modifier.fillMaxWidth()) }, confirmButton = { TextButton(onClick = vm::cancelOperation) { Text("Cancel") } }) }
     if (vm.cameraRecovery) AlertDialog(onDismissRequest = {}, title = { Text("Unfinished photo") }, text = { Text("A camera capture was interrupted. Keep the photo if it was taken, or discard the capture.") }, confirmButton = { TextButton(onClick = { vm.resolveCamera(true) }) { Text("Keep photo") } }, dismissButton = { TextButton(onClick = { vm.resolveCamera(false) }) { Text("Discard") } })
@@ -604,6 +609,7 @@ private fun annotatedLine(document: Document, start: Int, end: Int, match: dev.s
                 Text(if (slot.nameConfirmed) slot.name else stringResource(R.string.backup_unconfirmed_name, slot.name), style = MaterialTheme.typography.titleMedium)
             } else status?.location?.let { Text(it, style = MaterialTheme.typography.titleMedium) }
             if (config?.mode == BackupMode.LEGACY) Text(stringResource(R.string.backup_migration), color = MaterialTheme.colorScheme.error)
+            if (config?.mode == BackupMode.PAIR && config.pairTag == null) Text(stringResource(R.string.backup_whole_files), color = MaterialTheme.colorScheme.onSurfaceVariant)
             status?.savedAt?.let { saved ->
                 val time = java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT).format(java.util.Date(saved))
                 Text(if (config?.mode == BackupMode.PAIR) "Latest verified: slot ${if (config.active == 0) "A" else "B"} - $time" else "Previously saved: $time")

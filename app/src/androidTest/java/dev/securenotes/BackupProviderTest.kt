@@ -84,7 +84,10 @@ class BackupProviderTest {
             repository.open(testRoot)
             val phrase = "cherisher driven greedily motion pyramid skipping unbundle vertigo"
             repository.ensurePassphrase { phrase }; repository.confirmPassphrase()
-            repository.save(Note(title = "Provider original"))
+            val photo = ByteArray(2 * 1024 * 1024 + 99) { (it % 241).toByte() }
+            val photoSource = File(File(context.cacheDir, "camera").apply { mkdirs() }, "$id-photo.jpg").apply { writeBytes(photo) }
+            repository.import(Note(title = "Provider original"), androidx.core.content.FileProvider.getUriForFile(context, "${context.packageName}.camera", photoSource))
+            photoSource.delete()
             val source = BackupService(context, repository) {}
             backup = source
             val settings = VaultBackupSettings(repository)
@@ -110,24 +113,38 @@ class BackupProviderTest {
             val pair = settings.load()
             assertEquals(1, pair.active); assertEquals(2, pair.slots.size)
             assertTrue(files.hasGrant(tree)); assertNotEquals(pair.slots[0].uri, pair.slots[1].uri)
+            // The attachment is one file in a confirmed folder beside the pair, recorded with its exact ciphertext.
+            val folder = checkNotNull(pair.attachmentFolder)
+            val saved = settings.files(checkNotNull(pair.pairTag)).values.single()
+            assertTrue(saved.complete)
+            assertEquals(listOf(saved.uri to saved.length), files.children(folder.uri).map { it.uri to it.size })
+            assertEquals(saved.digest, files.openRead(saved.uri).use(::ciphertextDigest))
+            suspend fun restore(index: String): Int = try { source.stage(Uri.parse(index), phrase.toCharArray()) {} }
+                catch (e: AttachmentFolderNeeded) { assertEquals(folder.name, e.folder); source.stageFolder(DocumentTreeFolder(context.contentResolver, Uri.parse(tree))) {} }
             for (slot in pair.slots) {
                 assertEquals(slot.sha256, files.openRead(slot.uri).use(::ciphertextDigest))
                 repository.notes.value.forEach { repository.delete(it.id) }
                 repository.save(Note(title = "Before restore"))
-                assertEquals(1, source.stage(Uri.parse(slot.uri), phrase.toCharArray()) {})
+                assertEquals(1, restore(slot.uri))
                 source.commit(); assertEquals("Provider original", repository.notes.value.single().title)
+                val attachment = repository.attachments().values.single()
+                repository.access { v -> v.read(attachment.id).use { assertArrayEquals(photo, it.readBytes()) } }
             }
             repository.save(repository.notes.value.single().copy(title = "Provider updated", updatedAt = System.currentTimeMillis() + 1))
             coordinator.run()
             val updated = settings.load()
             assertEquals(0, updated.active); assertFalse(updated.pending); assertNull(updated.error)
             assertEquals(pair.slots[1], updated.slots[1])
-            source.stage(Uri.parse(updated.slots[0].uri), phrase.toCharArray()) {}; source.commit()
+            // A text edit leaves the attachment file as it was.
+            assertEquals(listOf(saved.uri to saved.length), files.children(folder.uri).map { it.uri to it.size })
+            assertEquals(saved.digest, files.openRead(saved.uri).use(::ciphertextDigest))
+            restore(updated.slots[0].uri); source.commit()
             assertEquals("Provider updated", repository.notes.value.single().title)
             // Re-selecting the folder creates a new pair and never deletes the historical pair.
             assertTrue(coordinator.choose(tree).accepted)
             assertTrue(settings.load().managedUris.intersect(pair.managedUris).isEmpty())
             pair.slots.forEach { files.openRead(it.uri).close() }
+            files.openRead(saved.uri).close()
             val newPair = settings.load()
             if (InstrumentationRegistry.getArguments().getString("backupCheckpoint") == "interrupt") {
                 // Synthetic fixture only. The host kills this instrumentation process mid-copy and
@@ -200,7 +217,9 @@ class BackupProviderTest {
             val phrase = repository.passphrase().toCharArray()
             try {
                 for (slot in repaired.slots) {
-                    backups.stage(Uri.parse(slot.uri), phrase) {}; backups.commit()
+                    try { backups.stage(Uri.parse(slot.uri), phrase) {} }
+                    catch (_: AttachmentFolderNeeded) { backups.stageFolder(DocumentTreeFolder(context.contentResolver, Uri.parse(tree))) {} }
+                    backups.commit()
                     assertEquals("Provider updated", repository.notes.value.single().title)
                 }
             } finally { phrase.fill('\u0000') }

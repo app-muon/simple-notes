@@ -58,9 +58,30 @@ The service notification is minimal and silent; holds release on job completion,
 
 Startup idempotently removes only the obsolete `backup` notification channel, preserving `verified-backup` and its settings. The internal `@VisibleForTesting` backup creation helper deliberately bypasses phrase confirmation for fixtures; production preparation always requires confirmation.
 
+### Attachment files
+
+Pairs created by this version save each attachment once, in its own `.ssna` file in an attachment directory beside the two indexes (see [the format](backup-format.md)). Pairs created earlier keep saving whole files until a new pair is created; neither of their slots is converted in place.
+
+Guarantees:
+
+- An interrupted save does not modify the active index or its completed attachment files.
+- A/B protects replacing the index. Both indexes share attachment files, so losing or corrupting one attachment can affect both.
+- Routine saves do not establish that every attachment written earlier is still intact.
+- Local verification does not confirm external upload.
+
+A routine save verifies the active index as before, then lists the attachment directory once. Every completed attachment file must be present at its exact recorded ciphertext size; no attachment is read. Damage needs two independent signals, because a single listing can be wrong (the Downloads provider's listing can lag the disk): a file is confirmed missing only if the listing omits it *and* opening its recorded URI reports it not found, and confirmed the wrong size only if the listing reports a non-null size that differs *and* the document's own descriptor reports the same size. Either gives `ATTACHMENT_DAMAGED`, which pauses writes to the pair until a new pair is created, like `ACTIVE_DAMAGED`. A failed listing, revoked permission, unknown size or disagreeing signals are "unverified" (`IO` or `ACCESS`) and stay retryable. In none of these cases is either index opened for writing.
+
+New attachments are encrypted one at a time into a cache file, with the vault blob's length and SHA-256 checked as it is read; only one attachment-sized temporary file exists at a time, and the repository mutex protects that blob while it is read. If an attachment from the captured snapshot has since been removed, the attempt is abandoned without an error; the edit that removed it schedules a fresh attempt. For each file, Notes creates the document, requires its provider-confirmed name, commits a record of its URI, name and expected ciphertext measurements, writes and reads it back, and only then marks the record complete. A recorded but unfinished file is first checked against its expected measurements and completed if it matches; otherwise it is re-encrypted, the new measurements are committed, and only after that commit succeeds is the same document reopened for writing. A missing unfinished document is replaced by a new one. A completed attachment is never reopened for writing. An attachment ID that reappears with a different plaintext length or hash (for example after restoring a different history) is an identity conflict: it gives `ATTACHMENT_DAMAGED` and requires a new pair. Completed records persist independently of index publication, so a lock, the service time limit or process death costs at most the unfinished attachment. Every record and key commit follows the configuration rule: an uncertain outcome blocks backup changes until restart.
+
+Each pair has its own random Tink streaming keyset for attachment files. It is stored in SQLCipher next to the plaintext recovery phrase that already protects every backup, and inside each encrypted index, so anyone holding the phrase and an index can read the pair's attachments, exactly as with embedded attachments. It is a random key, not a key derived from the phrase, so no phrase-derived key is cached. A new pair gets a new key and rewrites its attachments once.
+
+The attachment directory shows anyone with access to the synced folder how many attachments a pair has saved and their approximate sizes; the single-file format hid both. File names are random attachment UUIDs and reveal nothing else. No size padding is applied. Completed files are kept for the pair's lifetime, including removed attachments, so the other slot and older index copies in the cloud stay restorable; this also keeps removed attachments in the backup until a new pair is created. Documents left by a crash between creation and recording are also kept: they are never adopted by name.
+
+Setup writes the key first, then every attachment, then both indexes, and commits the configuration last. A failure before that commit deletes the folder and every file it created and removes the new key and records; after an uncertain commit everything is kept. A successful setup removes the previous pair's key and records from device settings, never its files.
+
 ### Intentional format and privacy decisions
 
-The A/B protocol retains streamed .ssnb/Tink encryption with fresh salts and keys, attachment streaming, and staged vault publication. It does not introduce whole-file JSON encryption, a total-size cap, cached derived keys, plaintext preferences, or plaintext JSON export. Explicit content revisions are retained instead of Room invalidation. Existing backups remain readable. The unchanged envelope cannot always distinguish incorrect phrases from damaged or truncated files before full decryption.
+The A/B protocol retains streamed .ssnb/Tink encryption with fresh salts and keys, attachment streaming, and staged vault publication. It does not introduce whole-file JSON encryption, a total-size cap, cached derived keys, plaintext preferences, or plaintext JSON export. Version-4 pairs add per-pair random attachment keys and visible attachment file counts and sizes, described above. Explicit content revisions are retained instead of Room invalidation. Existing backups remain readable. The unchanged envelope cannot always distinguish incorrect phrases from damaged or truncated files before full decryption.
 
 ## Session lifetime
 
