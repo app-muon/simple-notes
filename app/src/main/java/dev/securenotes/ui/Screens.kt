@@ -63,17 +63,31 @@ import dev.securenotes.backup.BackupProblem
 import dev.securenotes.backup.BackupError
 import dev.securenotes.R
 import dev.securenotes.document.*
+import dev.securenotes.storage.displayName
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.time.Duration.Companion.milliseconds
 
+/** What an attachment's tile and the image viewer can do with it, by attachment id. */
+private class AttachmentActions(val open: (String) -> Unit, val share: (String) -> Unit, val save: (String) -> Unit)
+
+/** The save picker, suggesting a name and type per launch. */
+private class SaveAs : androidx.activity.result.contract.ActivityResultContract<Pair<String, String>, android.net.Uri?>() {
+    override fun createIntent(context: android.content.Context, input: Pair<String, String>) = android.content.Intent(android.content.Intent.ACTION_CREATE_DOCUMENT)
+        .addCategory(android.content.Intent.CATEGORY_OPENABLE).setType(input.second).putExtra(android.content.Intent.EXTRA_TITLE, input.first)
+    override fun parseResult(resultCode: Int, intent: android.content.Intent?) = intent?.data?.takeIf { resultCode == android.app.Activity.RESULT_OK }
+}
+
 @Composable
-fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: () -> Unit, openFile: (String) -> Unit, recover: (CharArray) -> Unit = {}, reveal: () -> Unit = {}) {
+fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: () -> Unit, openFile: (String) -> Unit, recover: (CharArray) -> Unit = {}, reveal: () -> Unit = {}, share: (String) -> Unit = {}) {
     val unlocked by vm.app.unlocked.collectAsStateWithLifecycle()
     // Register while locked as well, so a returning camera can deliver its result after process death.
     val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture(), vm.app.camera::result)
+    // Likewise, so a save cancelled by locking still removes the picker's empty document.
+    val saver = rememberLauncherForActivityResult(SaveAs(), vm::saveAttachment)
+    val actions = remember(openFile, share, saver) { AttachmentActions(openFile, share) { id -> vm.requestSave(id) { saver.launch(it) } } }
     val cameraRevision by vm.app.camera.revision.collectAsStateWithLifecycle()
     LaunchedEffect(unlocked, cameraRevision) { if (unlocked) vm.recoverCamera() }
     val dark = isSystemInDarkTheme()
@@ -88,7 +102,7 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
     }) {
     MaterialTheme(colorScheme = if (dark) darkColorScheme(primary = Color(0xFF9AD5B5)) else lightColorScheme(primary = Color(0xFF386A54), background = Color(0xFFFAFAF6))) {
         Surface(Modifier.fillMaxSize()) {
-            if (!unlocked) LockedScreen(vm, authenticate, configureLock, recover) else UnlockedScreens(vm, openFile, reveal) { vm.prepareCamera { camera.launch(it) } }
+            if (!unlocked) LockedScreen(vm, authenticate, configureLock, recover) else UnlockedScreens(vm, actions, reveal) { vm.prepareCamera { camera.launch(it) } }
             vm.error?.let { message -> AlertDialog(onDismissRequest = { vm.error = null }, title = { Text("Unable to finish") }, text = { Text(message) }, confirmButton = { TextButton(onClick = { vm.error = null }) { Text("OK") } }) }
         }
     }
@@ -140,7 +154,7 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
         { recovering = false }) { recovering = false; recover(it) }
 }
 
-@Composable private fun UnlockedScreens(vm: NotesViewModel, openFile: (String) -> Unit, reveal: () -> Unit, takePhoto: () -> Unit) {
+@Composable private fun UnlockedScreens(vm: NotesViewModel, actions: AttachmentActions, reveal: () -> Unit, takePhoto: () -> Unit) {
     val context = LocalContext.current
     val focus = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
@@ -186,9 +200,9 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
             Box(Modifier.weight(1f).then(if (banner != null) Modifier.consumeWindowInsets(WindowInsets.statusBars) else Modifier)) { when (vm.screen) {
             Screen.LIST -> NotesList(vm)
             Screen.SEARCH -> SearchScreen(vm, back)
-            Screen.NOTE -> NoteScreen(vm, back, attach, openFile)
+            Screen.NOTE -> NoteScreen(vm, back, attach, actions)
             Screen.SETTINGS -> SettingsScreen(vm, back, reveal, chooseRestore, chooseBackup)
-            Screen.IMAGE -> ImageViewer(vm, back)
+            Screen.IMAGE -> ImageViewer(vm, back, actions)
         }
             if (vm.reviewingBackup) Box(Modifier.matchParentSize().clickable(interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }, indication = null) {})
         } }
@@ -265,7 +279,7 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
     }
 }
 
-@Composable private fun NoteScreen(vm: NotesViewModel, back: () -> Unit, attach: (String) -> Unit, openFile: (String) -> Unit) {
+@Composable private fun NoteScreen(vm: NotesViewModel, back: () -> Unit, attach: (String) -> Unit, actions: AttachmentActions) {
     val note = vm.note ?: return
     val titleFocus = remember(note.id) { FocusRequester() }
     val findFocus = remember(note.id) { FocusRequester() }
@@ -421,7 +435,7 @@ fun SecureNotesApp(vm: NotesViewModel, authenticate: () -> Unit, configureLock: 
                         textPlaced = { line, coordinates -> content?.let { lineTops[line] = it.localPositionOf(coordinates, Offset.Zero).y.toInt() } })
                 }
             }
-            AttachmentsSection(vm, note, highlight, attach, openFile, Modifier.onGloballyPositioned { c -> content?.let { attachmentsTop = it.localPositionOf(c, Offset.Zero).y.toInt() } })
+            AttachmentsSection(vm, note, highlight, attach, actions, Modifier.onGloballyPositioned { c -> content?.let { attachmentsTop = it.localPositionOf(c, Offset.Zero).y.toInt() } })
         }
     }
     if (tagPicker) TagPickerSheet(vm) { tagPicker = false }
@@ -493,8 +507,8 @@ private fun annotatedLine(document: Document, start: Int, end: Int, match: dev.s
     }
 }
 
-/** Images and files live here, below the text, in both modes. Editing adds [+] and per-item Move/Remove. */
-@Composable private fun AttachmentsSection(vm: NotesViewModel, note: Note, highlight: dev.securenotes.search.SearchHit?, attach: (String) -> Unit, openFile: (String) -> Unit, modifier: Modifier) {
+/** Images and files live here, below the text, in both modes. Each item's menu shares or saves it; editing adds [+] and Move/Remove. */
+@Composable private fun AttachmentsSection(vm: NotesViewModel, note: Note, highlight: dev.securenotes.search.SearchHit?, attach: (String) -> Unit, actions: AttachmentActions, modifier: Modifier) {
     val ids = note.document.attachments
     if (ids.isEmpty() && !vm.editing) return
     var menu by remember { mutableStateOf(false) }
@@ -509,31 +523,34 @@ private fun annotatedLine(document: Document, start: Int, end: Int, match: dev.s
         }
         if (ids.isEmpty()) Text("Add photos or files with +.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            ids.forEachIndexed { index, id -> key(id) { AttachmentTile(vm, id, index, ids.size, highlight?.attachmentId == id, openFile) } }
+            ids.forEachIndexed { index, id -> key(id) { AttachmentTile(vm, id, index, ids.size, highlight?.attachmentId == id, actions) } }
         }
     }
 }
 
-@Composable private fun AttachmentTile(vm: NotesViewModel, id: String, index: Int, count: Int, highlighted: Boolean, openFile: (String) -> Unit) {
+@Composable private fun AttachmentTile(vm: NotesViewModel, id: String, index: Int, count: Int, highlighted: Boolean, actions: AttachmentActions) {
     val attachment = vm.attachments[id] ?: return
     val image = attachment.mime.startsWith("image/")
     val bitmap by attachmentBitmap(vm, id, 400)
     var menu by remember { mutableStateOf(false) }
     Box {
-        Card(Modifier.size(104.dp).clickable { if (image) { vm.imageId = id; vm.screen = Screen.IMAGE } else openFile(id) },
+        Card(Modifier.size(104.dp).clickable { if (image) { vm.imageId = id; vm.screen = Screen.IMAGE } else actions.open(id) },
             border = if (highlighted) BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else null,
             colors = CardDefaults.cardColors(containerColor = if (highlighted) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceContainer)) {
             val shown = bitmap
-            if (image && shown != null) Image(shown.asImageBitmap(), attachment.filename, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+            if (image && shown != null) Image(shown.asImageBitmap(), attachment.displayName, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
             else Column(Modifier.fillMaxSize().padding(8.dp), verticalArrangement = Arrangement.SpaceBetween) {
                 Icon(if (image) Icons.Default.Image else Icons.AutoMirrored.Filled.InsertDriveFile, null)
-                Text(attachment.filename, style = MaterialTheme.typography.labelSmall, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                Text(attachment.displayName, style = MaterialTheme.typography.labelSmall, maxLines = 3, overflow = TextOverflow.Ellipsis)
             }
         }
-        if (vm.editing) {
-            IconButton(onClick = { menu = true }, modifier = Modifier.align(Alignment.TopEnd).size(36.dp)
-                .background(MaterialTheme.colorScheme.surface.copy(alpha = .85f), androidx.compose.foundation.shape.CircleShape)) { Icon(Icons.Default.MoreVert, "Options for ${attachment.filename}") }
-            DropdownMenu(menu, { menu = false }) {
+        IconButton(onClick = { menu = true }, modifier = Modifier.align(Alignment.TopEnd).size(36.dp)
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = .85f), androidx.compose.foundation.shape.CircleShape)) { Icon(Icons.Default.MoreVert, "Options for ${attachment.displayName}") }
+        DropdownMenu(menu, { menu = false }) {
+            DropdownMenuItem(text = { Text("Share") }, onClick = { menu = false; actions.share(id) })
+            DropdownMenuItem(text = { Text("Save to device") }, onClick = { menu = false; actions.save(id) })
+            if (vm.editing) {
+                HorizontalDivider()
                 DropdownMenuItem(text = { Text("Move left") }, enabled = index > 0, onClick = { menu = false; vm.moveAttachment(id, -1) })
                 DropdownMenuItem(text = { Text("Move right") }, enabled = index < count - 1, onClick = { menu = false; vm.moveAttachment(id, 1) })
                 DropdownMenuItem(text = { Text("Remove") }, onClick = { menu = false; vm.removeAttachment(id) })
@@ -549,13 +566,22 @@ private fun annotatedLine(document: Document, start: Int, end: Int, match: dev.s
     } } catch (_: Exception) { null }
 }
 
-@Composable private fun ImageViewer(vm: NotesViewModel, back: () -> Unit) {
+@Composable private fun ImageViewer(vm: NotesViewModel, back: () -> Unit, actions: AttachmentActions) {
     val id = vm.imageId ?: return
     val bitmap by attachmentBitmap(vm, id, 3000)
     var scale by remember { mutableFloatStateOf(1f) }; var x by remember { mutableFloatStateOf(0f) }; var y by remember { mutableFloatStateOf(0f) }
-    Scaffold(topBar = { TopAppBar(title = { Text(vm.attachments[id]?.filename ?: "Image", maxLines = 1, overflow = TextOverflow.Ellipsis) }, navigationIcon = { BackButton(back) }) }) { padding ->
+    var menu by remember { mutableStateOf(false) }
+    Scaffold(topBar = { TopAppBar(title = { Text(vm.attachments[id]?.displayName ?: "Image", maxLines = 1, overflow = TextOverflow.Ellipsis) }, navigationIcon = { BackButton(back) }, actions = {
+        IconButton(onClick = { actions.share(id) }) { Icon(Icons.Default.Share, "Share") }
+        Box {
+            IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "Image menu") }
+            DropdownMenu(menu, { menu = false }) {
+                DropdownMenuItem(text = { Text("Save to device") }, leadingIcon = { Icon(Icons.Default.Download, null) }, onClick = { menu = false; actions.save(id) })
+            }
+        }
+    }) }) { padding ->
         Box(Modifier.fillMaxSize().padding(padding).pointerInput(Unit) { detectTransformGestures { _, pan, zoom, _ -> scale = (scale * zoom).coerceIn(1f, 6f); if (scale > 1) { x += pan.x; y += pan.y } else { x = 0f; y = 0f } } }, contentAlignment = Alignment.Center) {
-            if (bitmap == null) Text("Image unavailable") else Image(bitmap!!.asImageBitmap(), vm.attachments[id]?.filename, Modifier.fillMaxSize().graphicsLayer { scaleX = scale; scaleY = scale; translationX = x; translationY = y })
+            if (bitmap == null) Text("Image unavailable") else Image(bitmap!!.asImageBitmap(), vm.attachments[id]?.displayName, Modifier.fillMaxSize().graphicsLayer { scaleX = scale; scaleY = scale; translationX = x; translationY = y })
         }
     }
 }

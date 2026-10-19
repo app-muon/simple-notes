@@ -996,12 +996,42 @@ class UiFlowTest {
         compose.waitUntil(10_000) { compose.onAllNodesWithContentDescription("image-test.png").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithContentDescription("image-test.png").performScrollTo().performClick()
         compose.waitUntil { vm.screen == Screen.IMAGE }
+        compose.onNodeWithContentDescription("Share").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Image menu").performClick()
+        compose.onNodeWithText("Save to device").assertIsDisplayed()
+        androidx.test.espresso.Espresso.pressBack()
         compose.onNodeWithContentDescription("Back").performClick()
+        // Reading mode offers only Share and Save; Move and Remove need editing.
+        compose.onNodeWithContentDescription("Options for image-test.png").performScrollTo().performClick()
+        compose.onNodeWithText("Share").assertIsDisplayed()
+        compose.onNodeWithText("Save to device").assertIsDisplayed()
+        compose.onNodeWithText("Move left").assertDoesNotExist()
+        androidx.test.espresso.Espresso.pressBack()
         compose.runOnUiThread { vm.enterEditing(0) }
         compose.onNodeWithContentDescription("Options for image-test.png").performScrollTo().performClick()
         compose.onNodeWithText("Move left").assertIsNotEnabled()
         compose.onNodeWithText("Move right").performClick()
         compose.waitUntil(10_000) { app.repository.notes.value.single().document.attachments == note.document.attachments.reversed() }
         file.delete(); text.delete()
+    }
+    @Test fun shareGrantsOutlastReturningFromAViewerAndEndAtLock() {
+        unlock()
+        val text = File(File(app.cacheDir, "camera").apply { mkdirs() }, "share-test.txt").apply { writeText("Shared text") }
+        val id = runBlocking {
+            app.repository.import(Note(title = "Share"), androidx.core.content.FileProvider.getUriForFile(app, "${app.packageName}.camera", text))
+        }.document.attachments.single()
+        val viewed = android.net.Uri.parse("content://${app.packageName}.attachments/$id")
+        val shared = android.net.Uri.parse("content://${app.packageName}.attachments/shared/$id")
+        app.grants.add(viewed); app.shareGrants.add(shared)
+        app.revokeGrants() // What returning from an external viewer does.
+        assertTrue(runCatching { app.contentResolver.openInputStream(viewed)!!.close() }.isFailure)
+        assertEquals("Shared text", app.contentResolver.openInputStream(shared)!!.use { it.readBytes().decodeToString() })
+        app.contentResolver.query(shared, null, null, null, null)!!.use { it.moveToFirst(); assertEquals("share-test.txt", it.getString(it.getColumnIndexOrThrow(android.provider.OpenableColumns.DISPLAY_NAME))) }
+        val other = android.net.Uri.parse("content://${app.packageName}.attachments/other/$id")
+        app.shareGrants.add(other)
+        assertTrue(runCatching { app.contentResolver.openInputStream(other)!!.close() }.isFailure)
+        compose.runOnUiThread { app.lock() }
+        assertTrue(app.shareGrants.isEmpty())
+        text.delete()
     }
 }
