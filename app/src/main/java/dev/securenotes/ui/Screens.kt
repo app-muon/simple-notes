@@ -609,7 +609,8 @@ private fun annotatedLine(document: Document, start: Int, end: Int, match: dev.s
                 Text(if (slot.nameConfirmed) slot.name else stringResource(R.string.backup_unconfirmed_name, slot.name), style = MaterialTheme.typography.titleMedium)
             } else status?.location?.let { Text(it, style = MaterialTheme.typography.titleMedium) }
             if (config?.mode == BackupMode.LEGACY) Text(stringResource(R.string.backup_migration), color = MaterialTheme.colorScheme.error)
-            if (config?.mode == BackupMode.PAIR && config.pairTag == null) Text(stringResource(R.string.backup_whole_files), color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (config?.mode == BackupMode.PAIR && config.pairTag == null && config.setup == null) Text(stringResource(R.string.backup_whole_files), color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (config?.setup != null) Text(stringResource(R.string.backup_setup_pending), color = MaterialTheme.colorScheme.error)
             fun time(at: Long) = java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT).format(java.util.Date(at))
             status?.savedAt?.let { saved ->
                 Text(if (config?.mode == BackupMode.PAIR) stringResource(R.string.backup_last_save, if (config.active == 0) "A" else "B", time(saved)) else "Previously saved: ${time(saved)}")
@@ -628,7 +629,14 @@ private fun annotatedLine(document: Document, start: Int, end: Int, match: dev.s
                     modifier = Modifier.fillMaxWidth()) { Text(if (checkAccess) stringResource(R.string.backup_check_access) else "Back up now") }
                 OutlinedButton(onClick = vm::verifyBackup, enabled = enabled, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.backup_verify)) }
             }
-            OutlinedButton(onClick = chooseBackup, enabled = enabled, modifier = Modifier.fillMaxWidth()) { Text(if (config?.mode == BackupMode.PAIR) "Create new backup pair" else "Choose backup folder") }
+            if (config?.setup != null) {
+                FilledTonalButton(onClick = { if (vm.app.autoBackup.setupNeedsReview()) reveal() else vm.resumeBackupSetup() }, enabled = enabled, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.backup_resume_setup)) }
+                TextButton(onClick = vm::discardBackupSetup, enabled = enabled, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.backup_discard_setup)) }
+            } else {
+                if (config?.mode == BackupMode.PAIR && config.pairTag == null) OutlinedButton(onClick = { if (vm.app.autoBackup.setupNeedsReview()) reveal() else vm.upgradeBackup() },
+                    enabled = enabled, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.backup_upgrade)) }
+                OutlinedButton(onClick = chooseBackup, enabled = enabled, modifier = Modifier.fillMaxWidth()) { Text(if (config?.mode == BackupMode.PAIR) "Create new backup pair" else "Choose backup folder") }
+            }
             if (config != null && config.mode != BackupMode.DISABLED) TextButton(onClick = vm::turnOffBackup, enabled = enabled, modifier = Modifier.fillMaxWidth()) { Text("Turn off automatic backup") }
             OutlinedButton(onClick = restore, modifier = Modifier.fillMaxWidth()) { Text("Restore from backup") }
             Spacer(Modifier.height(16.dp)); Text("${stringResource(R.string.app_name)} · ${dev.securenotes.BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

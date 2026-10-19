@@ -1,7 +1,13 @@
 <resources>
     <string name="app_name">Notes</string>
     <string name="backup_guidance">Choose a dedicated phone-storage subfolder, for example NotesBackups in Downloads. Notes alternates between two encrypted backup files and verifies each save locally. New pairs save each attachment once, in an attachments folder beside the two files; routine saves don\'t re-read attachments saved earlier, so use Verify backup now and then. Sync the whole folder, including subfolders, in upload-only mode. Local verification does not confirm an external upload.</string>
-    <string name="backup_whole_files">This pair saves every attachment again in each backup file. Create a new backup pair to save each attachment only once. The current files are kept.</string>
+    <string name="backup_whole_files">This pair saves every attachment again in each backup file. Upgrade backup creates a new pair in the same folder that saves each attachment only once; the current files are kept.</string>
+    <string name="backup_upgrade">Upgrade backup</string>
+    <string name="backup_setup_pending">A new backup pair is not finished. Resume setup continues where it stopped; Discard setup removes only the files it created. Your current backup keeps saving meanwhile.</string>
+    <string name="backup_resume_setup">Resume setup</string>
+    <string name="backup_discard_setup">Discard setup</string>
+    <string name="backup_setup_conflict">An attachment no longer matches the copy this unfinished setup saved, for example after restoring a different backup. Discard the setup and start again.</string>
+    <string name="backup_setup_phrase">The recovery phrase changed since this setup began. View and review the recovery phrase, then resume the setup.</string>
     <string name="backup_attachments_unverified">The backup\'s attachment files could not be checked, so their condition is unverified. No backup file was overwritten. Check access and retry with Back up now, or create a new pair if files are missing.</string>
     <string name="backup_attachments_access">The backup\'s attachment folder could not be accessed, so its files could not be checked. No backup file was overwritten. Check backup access in Settings and retry when access is available.</string>
     <string name="backup_attachment_damaged">An attachment file of this backup pair is missing or damaged. No backup file was overwritten. Create a new pair and keep the old files for recovery.</string>
@@ -31,7 +37,7 @@
     <string name="backup_active_unverified">The active backup file could not be read, so its condition could not be verified. No backup file was overwritten. Check access and retry with Back up now, or create a new pair if the file is missing.</string>
     <string name="backup_active_access">The active backup file could not be accessed, so its condition could not be verified. No backup file was overwritten. Check backup access in Settings and retry when access is available, or create a new pair if the file is missing or remains inaccessible.</string>
     <string name="backup_check_access">Check backup access</string>
-    <string name="backup_setup_io">The new backup pair could not be created and verified. Check storage and the provider, then choose a folder again. Existing backup files were not overwritten.</string>
+    <string name="backup_setup_io">The new backup pair could not be finished. Check storage and the provider, then resume the setup or choose a folder again. Existing backup files were not overwritten.</string>
     <string name="backup_setup_access">The selected folder could not be accessed. Choose the folder again and allow access, or choose another folder.</string>
     <string name="backup_setup_error">Setup: %1$s</string>
     <string name="backup_select_again">The backup folder selection is no longer valid. Unlock Notes and select the folder again.</string>

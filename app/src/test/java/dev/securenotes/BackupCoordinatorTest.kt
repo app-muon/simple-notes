@@ -351,29 +351,36 @@ class BackupCoordinatorTest {
         assertTrue(f.settings.record.slots.all { it.name.endsWith(" (2)") })
         val old = f.settings.record
         f.files.createUri = old.slots.first().uri
-        assertFalse(f.backup.choose("other").accepted); assertEquals(old, f.settings.record)
+        assertFalse(f.backup.choose("other").accepted); assertEquals(old, f.settings.record.copy(setup = null))
         assertTrue(old.slots.all { it.uri in f.files.data })
         f.files.createUri = "other/duplicate"
-        assertFalse(f.backup.choose("other").accepted); assertEquals(old, f.settings.record)
+        assertFalse(f.backup.choose("other").accepted); assertEquals(old, f.settings.record.copy(setup = null))
+        // The duplicate was recorded before it was rejected; discarding removes it and the permission the setup took.
+        assertEquals(listOf("other/duplicate"), f.settings.record.setup?.created)
+        f.files.createUri = null; assertEquals(BackupAdmission.ACCEPTED, f.backup.discardSetup())
+        assertEquals(old, f.settings.record)
         assertFalse("other/duplicate" in f.files.data); assertFalse("other" in f.files.grants)
     }
-    @Test fun `setup cancellation removes only new files and preserves same folder grant`() = runTest {
+    @Test fun `setup cancellation keeps new files for resume and discarding removes only them`() = runTest {
         val f = fixture(); f.setup(); val old = f.settings.record
         f.files.onCreate = { if (f.files.counter == 3) throw CancellationException() }
         try { f.backup.choose("folder").accepted } catch (_: CancellationException) { }
+        assertEquals(1, f.settings.record.setup?.created?.size); assertEquals(old, f.settings.record.copy(setup = null))
+        f.files.onCreate = {}; f.backup.discardSetup()
         assertEquals(old.managedUris, f.files.data.keys)
         assertTrue("folder" in f.files.grants); assertEquals(old, f.settings.record)
     }
     @Test fun `uncertain setup retains both pairs and grants while failed disable never releases`() = runTest {
         val f = fixture(); f.setup(); val old = f.settings.record
-        f.settings.failWrite = f.settings.writes + 1
+        // Activation is a setup's sixth configuration write without attachments: start, then each index's URI and name.
+        f.settings.failWrite = f.settings.writes + 6
         assertFalse(f.backup.choose("other").accepted)
         assertEquals(4, f.files.data.size); assertEquals(setOf("folder", "other"), f.files.grants)
-        assertEquals(old, f.settings.record)
+        assertEquals(old, f.settings.record.copy(setup = null))
         f.settings.failWrite = null; f.restart()
         f.settings.failWrite = f.settings.writes + 1
         try { f.backup.turnOff(); fail("Expected failure") } catch (_: IOException) { }
-        assertTrue("folder" in f.files.grants); assertEquals(old, f.settings.record)
+        assertTrue("folder" in f.files.grants); assertEquals(old, f.settings.record.copy(setup = null))
     }
     @Test fun `disable commits before grant release and never deletes backup files`() = runTest {
         val f = fixture(); f.setup(); val uris = f.files.data.keys.toSet()
@@ -578,10 +585,14 @@ class BackupCoordinatorTest {
         f.files.nameFailure = IOException("private", SecurityException())
         assertEquals(BackupAdmission.FAILED, f.backup.choose("other"))
         assertEquals(BackupProblem.ACCESS, f.backup.status.value!!.setupError!!.problem)
+        // The document was recorded before its name was asked for, so discarding removes it.
+        assertEquals(1, f.settings.record.setup?.created?.size)
+        f.files.nameFailure = null; f.backup.discardSetup()
         assertEquals(old.managedUris, f.files.data.keys); assertFalse("other" in f.files.grants)
         f.files.nameFailure = CancellationException()
         try { f.backup.choose("other"); fail("Expected cancellation") } catch (_: CancellationException) { }
-        assertEquals(old.managedUris, f.files.data.keys)
+        f.files.nameFailure = null; f.backup.discardSetup()
+        assertEquals(old.managedUris, f.files.data.keys); assertEquals(old, f.settings.record)
         val decoded = dev.securenotes.document.documentJson.decodeFromString<BackupSlot>("""{"uri":"old","name":"old.ssnb","length":1,"sha256":"${"a".repeat(64)}"}""")
         assertTrue(decoded.nameConfirmed)
     }
@@ -959,13 +970,17 @@ class BackupCoordinatorTest {
         assertEquals(1, f.files.directories.size); assertTrue(f.saved().getValue(id(1)).complete)
         assertTrue(f.files.events.none { it.startsWith("mkdir:") }); assertNull(f.settings.record.error)
     }
-    @Test fun `setup failures remove the folder files key and records they created`() = runTest {
+    @Test fun `failed setups keep their files and discarding removes the folder files key and records they created`() = runTest {
         for (failure in listOf("write", "name")) {
             val f = fixture(); f.source.attachments[id(1)] = "first".toByteArray(); f.setup()
             val old = f.settings.record; val data = f.files.data.keys.toSet(); val directories = f.files.directories.toSet()
             f.source.attachments[id(2)] = "second".toByteArray()
             if (failure == "write") f.files.failure = "write" else { f.files.missingName = true; f.files.name = null }
             assertEquals(BackupAdmission.FAILED, f.backup.choose("folder"))
+            assertNotNull(failure, f.settings.record.setup); assertEquals(failure, old, f.settings.record.copy(setup = null))
+            assertNotEquals(failure, directories, f.files.directories)
+            f.files.failure = null; f.files.missingName = false
+            assertEquals(BackupAdmission.ACCEPTED, f.backup.discardSetup())
             assertEquals(data, f.files.data.keys); assertEquals(directories, f.files.directories)
             assertEquals(old, f.settings.record)
             assertEquals(setOf(old.pairTag), f.settings.keys.keys); assertEquals(setOf(old.pairTag), f.settings.files.keys)
@@ -1093,6 +1108,116 @@ class BackupCoordinatorTest {
         assertEquals(1, s.acquisitions); assertEquals(0, s.holds); assertEquals(1, s.flushes)
         assertTrue(f.files.data.getValue(f.settings.record.slots[f.settings.record.active].uri).decodeToString().endsWith("revision ${f.source.revision}"))
         assertFalse(s.scheduler.state.value.mutationsBlocked)
+    }
+
+    /** A pair with [id] 1 and 2, then a new setup in [folder] whose second attachment write fails. */
+    private suspend fun TestScope.interruptedSetup(folder: String = "folder"): Fixture {
+        val f = fixture(); f.source.attachments[id(1)] = "first".toByteArray(); f.source.attachments[id(2)] = "second".toByteArray(); f.setup()
+        var writes = 0
+        f.files.onWrite = { if (++writes == 2) throw IOException("provider") }
+        assertEquals(BackupAdmission.FAILED, f.backup.choose(folder))
+        f.files.onWrite = {}
+        val pending = checkNotNull(f.settings.record.setup)
+        val files = f.settings.files.getValue(pending.pairTag)
+        assertTrue(files.getValue(id(1)).complete); assertFalse(files.getValue(id(2)).complete)
+        return f
+    }
+    @Test fun `an interrupted setup resumes reusing completed files while the current pair keeps saving`() = runTest {
+        val f = interruptedSetup(); val old = f.settings.record; val pending = checkNotNull(old.setup)
+        // Meanwhile the current pair saves, and keeps the unfinished setup as it was.
+        f.source.revision++; f.backup.run()
+        assertNull(f.settings.record.error); assertEquals(1 - old.active, f.settings.record.active); assertEquals(pending, f.settings.record.setup)
+        val latest = f.settings.record
+        // Resuming captures current content and rewrites only what is not complete.
+        f.source.attachments[id(3)] = "third".toByteArray(); f.source.revision++
+        val encrypted = f.source.encrypted.size
+        assertEquals(BackupAdmission.ACCEPTED, f.backup.resumeSetup())
+        val next = f.settings.record
+        assertEquals(pending.pairTag, next.pairTag); assertNull(next.setup); assertNull(next.error)
+        assertEquals(listOf(id(2), id(3)), f.source.encrypted.drop(encrypted))
+        assertEquals(setOf(id(1), id(2), id(3)), f.source.indexes.last().keys)
+        assertEquals(pending.attachmentFolder, next.attachmentFolder)
+        // The previous pair's files stay, its records go, and the shared folder permission is kept.
+        assertTrue(latest.slots.all { it.uri in f.files.data }); assertTrue("folder" in f.files.grants)
+        assertEquals(setOf(next.pairTag), f.settings.keys.keys); assertEquals(setOf(next.pairTag), f.settings.files.keys)
+        assertEquals(BackupAdmission.INELIGIBLE, f.backup.resumeSetup())
+    }
+    @Test fun `discarding a setup removes only its documents and keeps a permission still in use`() = runTest {
+        for (target in listOf("folder", "other")) {
+            val f = interruptedSetup(target); val pending = checkNotNull(f.settings.record.setup)
+            val made = pending.created + f.settings.files.getValue(pending.pairTag).values.map { it.uri }
+            f.source.revision++; f.backup.run(); val latest = f.settings.record
+            val kept = f.settings.files.getValue(checkNotNull(latest.pairTag)).values.map { it.uri } + latest.managedUris - pending.created.toSet()
+            assertEquals(BackupAdmission.ACCEPTED, f.backup.discardSetup())
+            assertEquals(target, latest.copy(setup = null), f.settings.record)
+            assertTrue(target, made.none { it in f.files.data || it in f.files.directories })
+            assertTrue(target, kept.all { it in f.files.data || it in f.files.directories })
+            assertEquals(target, target == "folder", target in f.files.grants); assertTrue("folder" in f.files.grants)
+            assertEquals(setOf(latest.pairTag), f.settings.keys.keys)
+        }
+    }
+    @Test fun `a restore while a setup is pending needs review for a new phrase and discarding for other content`() = runTest {
+        val f = interruptedSetup()
+        f.backup.publishRestore(f.source.phrase) { config, begin -> begin(); f.settings.record = config }
+        assertNotNull(f.settings.record.setup)
+        f.source.attachments[id(3)] = "restored".toByteArray(); f.source.revision++
+        assertEquals(BackupAdmission.ACCEPTED, f.backup.resumeSetup()); assertEquals(setOf(id(1), id(2), id(3)), f.source.indexes.last().keys)
+
+        val g = interruptedSetup()
+        g.source.phrase = "b".repeat(64)
+        g.backup.publishRestore(g.source.phrase) { config, begin -> begin(); g.settings.record = config }
+        assertEquals(BackupAdmission.FAILED, g.backup.resumeSetup())
+        assertEquals(BackupError(BackupProblem.PHRASE_CHANGED, "resume", "BackupFailure"), g.backup.status.value!!.setupError)
+        assertEquals(R.string.backup_setup_phrase, dev.securenotes.ui.backupErrorResource(g.backup.status.value!!.setupError!!, setup = true))
+        assertTrue(g.backup.setupNeedsReview()); assertNotNull(g.settings.record.setup)
+        g.backup.phraseReviewed(g.source.phrase)
+        assertEquals(BackupAdmission.ACCEPTED, g.backup.resumeSetup())
+        assertEquals(g.source.phrase, g.settings.record.phraseHash); assertNull(g.settings.record.error)
+
+        val h = interruptedSetup()
+        h.source.attachments[id(1)] = "other".toByteArray(); h.source.revision++
+        assertEquals(BackupAdmission.FAILED, h.backup.resumeSetup())
+        val conflict = h.backup.status.value!!.setupError!!
+        assertEquals(BackupProblem.ATTACHMENT_DAMAGED to "attachment-identity", conflict.problem to conflict.step)
+        assertEquals(R.string.backup_setup_conflict, dev.securenotes.ui.backupErrorResource(conflict, setup = true))
+        assertEquals(BackupAdmission.ACCEPTED, h.backup.discardSetup()); assertNull(h.settings.record.setup)
+    }
+    @Test fun `an uncertain setup commit blocks both configurations until restart`() = runTest {
+        val f = interruptedSetup()
+        f.settings.failRecord = f.settings.recordWrites + 1
+        assertEquals(BackupAdmission.FAILED, f.backup.resumeSetup()); assertTrue(f.backup.status.value!!.restartRequired)
+        val events = f.files.events.size; val record = f.settings.record
+        f.source.revision++; f.backup.run(true)
+        assertEquals(BackupAdmission.RESTART_REQUIRED, f.backup.resumeSetup()); assertEquals(BackupAdmission.RESTART_REQUIRED, f.backup.discardSetup())
+        assertFalse(f.backup.choose("other").accepted)
+        assertEquals(events, f.files.events.size); assertEquals(record, f.settings.record)
+        f.settings.failRecord = null; f.restart()
+        assertEquals(BackupAdmission.ACCEPTED, f.backup.resumeSetup()); assertNull(f.settings.record.setup)
+    }
+    @Test fun `a failed setup leaves no reservation so the current pair keeps saving automatically`() = runTest {
+        val f = fixture(); f.source.attachments[id(1)] = "first".toByteArray(); f.setup(); val s = Scheduling(backgroundScope, f)
+        s.scheduler.onForeground(); runCurrent()
+        val token = s.scheduler.beginSetup().token!!
+        f.files.failure = "write"; s.scheduler.submitSetup(token, "folder"); runCurrent(); f.files.failure = null
+        assertNotNull(f.settings.record.setup); assertFalse(s.scheduler.state.value.mutationsBlocked)
+        f.source.revision++; s.scheduler.trigger(); runCurrent()
+        assertTrue(f.files.data.getValue(f.settings.record.slots[f.settings.record.active].uri).decodeToString().endsWith("revision ${f.source.revision}"))
+        assertNotNull(f.settings.record.setup)
+        assertTrue(s.scheduler.resumeSetup().admission.accepted); runCurrent()
+        assertNull(f.settings.record.setup); assertNull(f.backup.status.value!!.setupError)
+        assertEquals(0, s.holds); assertFalse(s.scheduler.state.value.mutationsBlocked)
+    }
+    @Test fun `upgrading a whole-file pair creates a new pair in its folder and keeps its files`() = runTest {
+        val f = fixture(); f.source.attachments[id(1)] = "first".toByteArray(); f.setup()
+        f.settings.record = f.settings.record.copy(pairTag = null, attachmentFolder = null); f.settings.keys.clear(); f.settings.files.clear()
+        f.restart(); f.source.revision++; f.backup.run()
+        val whole = f.settings.record
+        assertTrue(f.files.data.getValue(whole.slots[whole.active].uri).decodeToString().startsWith("whole"))
+        assertTrue(f.backup.choose(checkNotNull(whole.folder)).accepted)
+        val upgraded = f.settings.record
+        assertNotNull(upgraded.pairTag); assertNotNull(upgraded.attachmentFolder); assertEquals(whole.folder, upgraded.folder)
+        assertTrue(whole.slots.all { it.uri in f.files.data }); assertEquals(setOf("folder"), f.files.grants)
+        assertTrue(f.saved().getValue(id(1)).complete)
     }
 }
 

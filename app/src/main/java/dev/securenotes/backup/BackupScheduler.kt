@@ -176,6 +176,23 @@ class BackupScheduler(
             runAttempts(force = true, progress = progress)
         })
     }
+    /**
+     * Continues an unfinished setup under a service hold. Unlike a new selection it holds no reservation, so between
+     * attempts the active pair keeps saving.
+     */
+    fun resumeSetup(progress: (String) -> Unit = {}): BackupRequest {
+        val admission = admission()
+        if (!admission.accepted) return BackupRequest(backup.rejectSetup(admission))
+        return BackupRequest(BackupAdmission.ACCEPTED, launchOwned(true, register = { explicit = it }) {
+            if (!flushSafely()) backup.setupFlushFailed()
+            else if (backup.resumeSetup(progress).accepted) deferredAutomatic = true
+        })
+    }
+    fun discardSetup(): BackupRequest {
+        val admission = admission()
+        if (!admission.accepted) return BackupRequest(admission)
+        return BackupRequest(BackupAdmission.ACCEPTED, launchOwned(false, register = { explicit = it }) { backup.discardSetup() })
+    }
     /** Reads and checks every file of the pair, without a service hold: leaving the app cancels it. */
     fun verify(progress: (String) -> Unit = {}): BackupRequest {
         val admission = admission()

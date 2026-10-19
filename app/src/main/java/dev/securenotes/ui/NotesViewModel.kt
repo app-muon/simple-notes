@@ -446,6 +446,15 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     fun checkBackupAccess() { if (canChooseBackup()) app.backupScheduler.refreshAccess() }
     fun backupNow() { if (canChooseBackup()) app.backupScheduler.manual() }
     fun verifyBackup() { if (canChooseBackup()) app.backupScheduler.verify() }
+    fun resumeBackupSetup() { if (canChooseBackup()) app.backupScheduler.resumeSetup() }
+    fun discardBackupSetup() { if (canChooseBackup()) app.backupScheduler.discardSetup() }
+    /** Creates a pair that saves each attachment once in the folder a whole-file pair already uses, without a picker. */
+    fun upgradeBackup() {
+        val folder = app.autoBackup.status.value?.configuration?.folder ?: return
+        if (!canChooseBackup()) return
+        val result = app.backupScheduler.beginSetup()
+        if (result.admission.accepted) app.backupScheduler.submitSetup(result.token, folder)
+    }
     fun turnOffBackup() { if (canChooseBackup()) app.backupScheduler.disable() }
     fun restore() {
         restoreCount = null

@@ -28,6 +28,7 @@ import dev.securenotes.backup.BackupManifest
 import dev.securenotes.backup.BackupMode
 import dev.securenotes.backup.BackupService
 import dev.securenotes.backup.BackupSlot
+import dev.securenotes.backup.PendingSetup
 import dev.securenotes.backup.VaultBackupSettings
 import dev.securenotes.document.*
 import dev.securenotes.security.Crypto
@@ -582,21 +583,26 @@ class StorageIntegrationTest {
     @Test fun restorePublicationCarriesThePairKeyAndAttachmentRecordsOnly() = runBlocking {
         repository.save(Note(title = "Restored"))
         val file = backup.create({})!!.first; sources += file
-        val tag = newId(); val other = newId()
+        val tag = newId(); val other = newId(); val unfinished = newId()
         val config = BackupConfiguration(mode = BackupMode.PAIR, folder = "content://synthetic/folder", slots = listOf("A", "B").map {
             BackupSlot("content://synthetic/$it", "$it.ssnb", 123, "a".repeat(64))
         }, active = 0, phraseHash = BackupService.phraseHash(phrase), fingerprint = "b".repeat(64), savedAt = 123,
-            pairTag = tag, attachmentFolder = BackupFolder("content://synthetic/folder/files", "files"))
+            pairTag = tag, attachmentFolder = BackupFolder("content://synthetic/folder/files", "files"),
+            setup = PendingSetup("content://synthetic/new", unfinished, "20261019T000000000Z", BackupService.phraseHash(phrase), ownsGrant = true))
         repository.access { VaultBackupSettings.write(it, config) }
         val settings = VaultBackupSettings(repository)
         val record = AttachmentFile(newId(), 5, "c".repeat(64), "content://synthetic/folder/files/1", "1.ssna", 70, "d".repeat(64), complete = true)
         settings.saveKey(tag, byteArrayOf(1, 2, 3)) {}; settings.saveFile(tag, record) {}
         settings.saveKey(other, byteArrayOf(4)) {}; settings.saveFile(other, record) {}
+        settings.saveKey(unfinished, byteArrayOf(5)) {}; settings.saveFile(unfinished, record.copy(complete = false)) {}
         backup.stage(source("pair.ssnb", file.readBytes()), phrase.toCharArray()) {}
         backup.commit()
         val restored = settings.load()
         assertEquals(tag, restored.pairTag); assertEquals(config.attachmentFolder, restored.attachmentFolder); assertTrue(restored.pending)
+        assertEquals(config.setup, restored.setup)
         assertArrayEquals(byteArrayOf(1, 2, 3), settings.key(tag)); assertEquals(mapOf(record.id to record), settings.files(tag))
+        // The unfinished setup's key and records move with it; unrelated rows do not.
+        assertArrayEquals(byteArrayOf(5), settings.key(unfinished)); assertEquals(mapOf(record.id to record.copy(complete = false)), settings.files(unfinished))
         assertNull(settings.key(other)); assertTrue(settings.files(other).isEmpty())
         settings.forget(tag)
         assertNull(settings.key(tag)); assertTrue(settings.files(tag).isEmpty())

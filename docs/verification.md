@@ -1,5 +1,20 @@
 # Verification
 
+## Attachment files, full checks and resumable setup, 19 October 2026
+
+New pairs keep only an index (manifest version 4) in their A/B files and save each attachment once as an encrypted `.ssna` file in a folder beside them. Routine saves list that folder instead of reading it; damage needs two independent signals. **Verify backup** reads both indexes and every attachment with restore's checks. Setup is resumable: an interrupted setup offers Resume and Discard while the current pair keeps saving, and **Upgrade backup** moves a whole-file pair to a new pair in the same folder. Restore asks for the attachment folder after authenticating the index. The device configuration moves to version 2; no Room schema change. Manifest versions 1–3 still restore.
+
+- Full JVM suite: **126 passed**. New coverage includes Tink segment boundaries (computed from its constants and checked against actual ciphertext lengths) and truncation exactly at a boundary. Keyset validation and the version-4 manifest rules are covered, including the 16 MiB limit on the complete index. The performance contract is checked by counting calls: text edits, reordering and removal never open existing attachment files. Damage versus unverified outcomes and retry ordering under failed and uncertain record commits are covered. So are full-check outcomes, a check cancelled by leaving the app while the leave-save still runs under one hold, pending setup alongside saves, Resume and Discard, restore while a setup is pending, and Upgrade.
+- Debug APK and instrumentation APK: **built successfully**. Lint: **0 errors, 10 warnings**, none in changed code. `git diff --check`: **passed**.
+- Full storage/UI/provider instrumentation run: **86 passed, 1 expected skip** on a disposable read-only Pixel 8 emulator, Android 17 / API 37, port 5580, with a synthetic test PIN. The skip is the reboot-recovery fixture, which needs a host-driven interruption and was not repeated.
+  - **Version-4 restore:** passed through a folder chosen as the parent, as the renamed directory itself, and after a wrong folder. Missing, truncated, swapped and ambiguous files are rejected, as are extra ZIP entries and invalid keysets.
+  - **Restore publication:** the pair's and the pending setup's keys and records move to the new generation.
+  - **Real Downloads provider:** confirmed the attachment folder and file, an unchanged `.ssna` after a text edit, and a full check of both slots. An interrupted setup was discarded through the provider, removing exactly its file and folder.
+
+Artifacts are under `%TEMP%/secure-notes-build`. Debug APK SHA-256: `05e5aa0cbe8fbd614cf4238cb249bd292230b81c992c8744bfd5574c00119101`. Transcript: `%TEMP%/notes-incremental-full.txt`.
+
+Not yet done: the force-stop/reboot recovery fixture with attachment files, a physical phone, Autosync uploads including the subfolder, and timings with a photo-heavy collection. These remain in the acceptance checklist.
+
 ## Sharing and saving attachments, 19 October 2026
 
 Added Share and Save to device for individual attachments, from each tile's menu in both modes and from the image viewer. Share grants use a separate `shared/<id>` provider path and last until the device locks; viewer grants still end on return. Save streams the decrypted attachment to a picker-chosen document and deletes a partial or unused empty one. New camera shots are named after their capture time. The Room schema and backup format are unchanged.

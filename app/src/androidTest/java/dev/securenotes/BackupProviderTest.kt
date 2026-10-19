@@ -145,6 +145,26 @@ class BackupProviderTest {
             assertNull(checked.error); assertNull(coordinator.status.value?.checkError)
             restore(updated.slots[0].uri); source.commit()
             assertEquals("Provider updated", repository.notes.value.single().title)
+            // An interrupted setup keeps what it made; Discard removes exactly that through the provider.
+            val failing = object : BackupFiles by files {
+                override fun openWrite(uri: String, mode: String): BackupOutput = throw java.io.IOException("interrupted")
+            }
+            val interrupted = AutoBackup(failing, settings, source, { true }).also { it.refresh() }
+            assertEquals(BackupAdmission.FAILED, interrupted.choose(tree))
+            val unfinished = checkNotNull(settings.load().setup)
+            val unfinishedFolder = checkNotNull(unfinished.attachmentFolder)
+            val unfinishedFile = settings.files(unfinished.pairTag).values.single()
+            assertFalse(unfinishedFile.complete)
+            assertEquals(listOf(unfinishedFile.uri), files.children(unfinishedFolder.uri).map { it.uri })
+            coordinator.refresh(); assertEquals(BackupAdmission.ACCEPTED, coordinator.discardSetup())
+            assertNull(settings.load().setup); assertTrue(settings.files(unfinished.pairTag).isEmpty())
+            try { files.openRead(unfinishedFile.uri).close(); fail("Discarded file remains") } catch (_: Exception) { }
+            val treeUri = Uri.parse(tree)
+            val root = DocumentsContract.buildDocumentUriUsingTree(treeUri, DocumentsContract.getTreeDocumentId(treeUri)).toString()
+            assertTrue(files.children(root).none { it.uri == unfinishedFolder.uri })
+            assertTrue(files.children(root).any { it.uri == folder.uri })
+            files.openRead(saved.uri).close(); updated.slots.forEach { files.openRead(it.uri).close() }
+            assertTrue(files.hasGrant(tree))
             // Re-selecting the folder creates a new pair and never deletes the historical pair.
             assertTrue(coordinator.choose(tree).accepted)
             assertTrue(settings.load().managedUris.intersect(pair.managedUris).isEmpty())

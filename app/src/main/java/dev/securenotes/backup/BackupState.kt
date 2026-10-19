@@ -16,6 +16,32 @@ import java.security.MessageDigest
 @Serializable data class FullCheck(val at: Long, val digests: List<String>, val slots: List<SlotCheck>)
 /** A pair's attachment directory, created when its first attachment is saved. Its name is always provider-confirmed. */
 @Serializable data class BackupFolder(val uri: String, val name: String)
+/** An index document an unfinished setup created; as for active slots, its name may be unconfirmed. */
+@Serializable data class SetupDocument(val uri: String, val name: String, val nameConfirmed: Boolean = true)
+/**
+ * A new pair that has not been activated. It is kept apart from the active pair, which keeps saving meanwhile, and
+ * lists every directory and index document it created, recorded before the provider is asked their names, so
+ * discarding it removes exactly those and the attachment files its records name.
+ */
+@Serializable data class PendingSetup(
+    val folder: String,
+    val pairTag: String,
+    val timestamp: String,
+    /** The phrase the setup was started or last resumed under; a different one needs review before it continues. */
+    val phraseHash: String,
+    /** The folder permission was taken for this setup; discarding releases it unless the active pair uses it. */
+    val ownsGrant: Boolean,
+    val attachmentFolder: BackupFolder? = null,
+    val slots: List<SetupDocument> = emptyList(),
+    val created: List<String> = emptyList(),
+) {
+    fun validate() {
+        require(folder.isNotBlank() && dev.securenotes.document.validId(pairTag) && timestamp.isNotBlank() && validDigest(phraseHash))
+        require(created.all { it.isNotBlank() } && created.distinct().size == created.size)
+        require(slots.size <= 2 && slots.all { it.uri in created && it.name.isNotBlank() })
+        attachmentFolder?.let { require(it.uri in created && it.name.isNotBlank()) }
+    }
+}
 /**
  * Device record of one attachment file in a pair: plaintext identity, document, and the expected ciphertext. Measurements
  * are committed before the document is opened for writing; [complete] only after it was written and read back.
@@ -50,9 +76,11 @@ enum class BackupAdmission {
     val pairTag: String? = null,
     val attachmentFolder: BackupFolder? = null,
     val check: FullCheck? = null,
+    val setup: PendingSetup? = null,
 ) {
     fun validate() {
         require(version in 1..2)
+        setup?.let { it.validate(); require(it.pairTag != pairTag) }
         when (mode) {
             BackupMode.DISABLED -> require(slots.isEmpty() && folder == null && legacyUri == null && pairTag == null && attachmentFolder == null && check == null)
             BackupMode.LEGACY -> require(!legacyUri.isNullOrBlank() && slots.isEmpty() && pairTag == null && attachmentFolder == null && check == null)
@@ -70,7 +98,7 @@ enum class BackupAdmission {
     /** The last full check read exactly the files that are recorded now. */
     val checkIsCurrent: Boolean get() = check != null && check.digests == slots.map { it.sha256 }
     val grant: String? get() = if (mode == BackupMode.LEGACY) legacyUri else folder
-    val managedUris: Set<String> get() = slots.map { it.uri }.toSet() + listOfNotNull(legacyUri, attachmentFolder?.uri)
+    val managedUris: Set<String> get() = slots.map { it.uri }.toSet() + listOfNotNull(legacyUri, attachmentFolder?.uri) + setup?.created.orEmpty()
     fun afterRestore(restoredPhraseHash: String): BackupConfiguration {
         if (mode != BackupMode.PAIR) return this
         val nextError = if (phraseHash != restoredPhraseHash) BackupError(BackupProblem.PHRASE_CHANGED, "restore")

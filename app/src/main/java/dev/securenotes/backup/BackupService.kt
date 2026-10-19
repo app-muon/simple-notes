@@ -294,7 +294,7 @@ class BackupService(private val context: Context, private val repository: NotesR
                 beginWrite()
                 val next = configuration ?: VaultBackupSettings.read(current).afterRestore(hash)
                 VaultBackupSettings.write(staged, next)
-                next.pairTag?.let { VaultBackupSettings.copyPair(current, staged, it) }
+                listOfNotNull(next.pairTag, next.setup?.pairTag).forEach { VaultBackupSettings.copyPair(current, staged, it) }
                 repository.activate(staged)
             } catch (e: Exception) {
                 if (repository.vault !== staged) { staged.close(); staged.directory.deleteRecursively() }
