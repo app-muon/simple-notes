@@ -1,5 +1,17 @@
 # Verification
 
+## Sharing and saving attachments, 19 October 2026
+
+Added Share and Save to device for individual attachments, from each tile's menu in both modes and from the image viewer. Share grants use a separate `shared/<id>` provider path and last until the device locks; viewer grants still end on return. Save streams the decrypted attachment to a picker-chosen document and deletes a partial or unused empty one. New camera shots are named after their capture time. The Room schema and backup format are unchanged.
+
+A review then found three cleanup gaps, now fixed. An unknown provider size read as zero, so an existing file could be deleted unwritten; only an explicitly zero size is now deleted. The `"w"` fallback could leave an existing file's trailing bytes; it is now used only for a document known to be empty. A save cancelled or locked out while queued behind the repository mutex or another operation skipped cleanup; cleanup now covers the whole save, and the view model discards the document when a queued save never starts.
+
+- Full JVM suite: **98 passed**.
+- Debug APK and instrumentation APK: **built successfully**. Lint: **0 errors, 11 warnings**; the new one is `UseKtx` on the share URI, matching the existing viewer URI, and the rest are version notices. `git diff --check`: **passed**.
+- Full storage/UI/provider instrumentation run: **82 passed** on a disposable read-only Pixel 8 emulator, Android 17 / API 37, port 5580, with a synthetic test PIN. New coverage: share grants survive revoking viewer grants, serve content and display name, reject other paths and end at lock; a save replaces longer destination contents with the exact plaintext; camera captures get a time-based name and legacy `<id>.jpg` names display as Photo.jpg; reading mode offers only Share and Save, and the viewer offers both. A test provider that rejects `"wt"`, keeps trailing bytes on `"w"` and can report a null size shows that unknown-size documents are kept, a non-empty document is never written without truncation, an empty one is, and a save cancelled or locked while waiting for the repository mutex deletes the picker's document. The view model's handling of a save that never starts is not covered by an automated test.
+
+Artifacts are under `%TEMP%/notes-share-build`. Debug APK SHA-256: `a259b325e3b731ed59c2b2328537c631663e1c80f0b15df9773b13caa7ec2afe`. Transcript: `%TEMP%/notes-review-android-tests.txt`. Real share targets, cloud save providers and the system save picker were not exercised; they remain in the acceptance checklist.
+
 ## Backup lifecycle follow-up, 15 October 2026
 
 Fixed the three follow-up review findings: an automatic/manual save keeps its original service hold through deferred background flushes and retries; accepted setup transfers from the activity view model to the process-wide scheduler; and active-file verification now precedes encryption as well as the inactive write. Access failures offer **Check backup access** while cached permission is unknown or missing. That action only refreshes eligibility on IO.

@@ -1,18 +1,30 @@
 package dev.securenotes
 
+import android.content.ContentProvider
+import android.content.ContentResolver
+import android.content.ContentValues
 import android.content.Context
 import android.content.ContextWrapper
+import android.content.pm.ProviderInfo
+import android.database.Cursor
+import android.database.MatrixCursor
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.pdf.PdfDocument
+import android.net.Uri
+import android.os.Bundle
+import android.os.ParcelFileDescriptor
+import android.provider.OpenableColumns
 import androidx.core.content.FileProvider
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.securenotes.backup.BackupService
 import dev.securenotes.document.*
 import dev.securenotes.security.Crypto
 import dev.securenotes.storage.NotesRepository
+import dev.securenotes.storage.displayName
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.withLock
 import org.junit.*
 import org.junit.Assert.*
 import java.io.File
@@ -25,10 +37,15 @@ class StorageIntegrationTest {
     private val root = Crypto.random(32)
     private val sources = mutableListOf<File>()
     @Volatile private var authorized = true
+    /** Replaces the repository's content resolver, to reach a [SaveDestination]. */
+    @Volatile private var resolver: ContentResolver? = null
     @Before fun setup() = runBlocking {
         System.loadLibrary("sqlcipher")
         directory = File(context.cacheDir, "test-${newId()}").apply { mkdirs() }
-        val isolated = object : ContextWrapper(context) { override fun getNoBackupFilesDir(): File = directory }
+        val isolated = object : ContextWrapper(context) {
+            override fun getNoBackupFilesDir(): File = directory
+            override fun getContentResolver(): ContentResolver = resolver ?: super.getContentResolver()
+        }
         repository = NotesRepository(isolated) { if (!authorized) throw CancellationException("Locked") }
         repository.open(root.copyOf())
         repository.ensurePassphrase { phrase }
@@ -189,6 +206,8 @@ class StorageIntegrationTest {
         file.writeBytes(bytes); sources += file
         return FileProvider.getUriForFile(context, "${context.packageName}.camera", file)
     }
+    private fun destination(contents: ByteArray, size: Long?, truncates: Boolean) =
+        SaveDestination(context, File(directory, "${newId()}-saved").apply { writeBytes(contents) }, size, truncates).also { resolver = it.resolver }
     @Test fun lockFlushesLatestAcceptedSnapshotEvenWhenNormalAccessIsRevoked() = runBlocking {
         val note = Note(title = "Draft")
         repository.mutex.lock()
@@ -248,6 +267,52 @@ class StorageIntegrationTest {
         assertEquals(note.id, restored.id); assertEquals(1, restored.document.attachments.size)
         assertNull(recreated.finish()); assertEquals(1, repository.attachments().size)
         assertFalse(recreated.hasPending())
+        val photo = repository.attachments().values.single()
+        assertTrue(photo.filename, photo.filename.matches(Regex("""Photo \d{4}-\d{2}-\d{2} \d{2}\.\d{2}\.\d{2}\.jpg""")))
+        assertEquals("Photo.jpg", photo.copy(filename = "${photo.id}.jpg").displayName)
+    }
+    @Test fun savedCopyIsPlaintextAndReplacesDestinationContents() = runBlocking {
+        val bytes = "Receipt for the shared trip".toByteArray()
+        repository.import(Note(title = "Save"), source("receipt.txt", bytes))
+        val attachment = repository.attachments().values.single()
+        val target = File(File(context.cacheDir, "camera"), "${newId()}-saved.txt").apply { writeBytes(ByteArray(4096) { 1 }); sources += this }
+        repository.saveCopy(attachment.id, FileProvider.getUriForFile(context, "${context.packageName}.camera", target))
+        assertArrayEquals(bytes, target.readBytes())
+    }
+    @Test fun saveKeepsDocumentsOfUnknownSizeAndNeverLeavesTrailingBytes() = runBlocking {
+        val bytes = "Receipt for the shared trip".toByteArray()
+        repository.import(Note(title = "Save"), source("receipt.txt", bytes))
+        val attachment = repository.attachments().values.single()
+        val existing = ByteArray(4096) { 1 }
+        val unknown = destination(existing, size = null, truncates = true)
+        repository.discardUnused(unknown.uri)
+        assertTrue(unknown.calls.isEmpty()); assertArrayEquals(existing, unknown.file.readBytes())
+        for (size in listOf(4096L, null)) {
+            val untruncated = destination(existing, size, truncates = false)
+            try { repository.saveCopy(attachment.id, untruncated.uri); fail("Wrote without truncating") } catch (_: java.io.IOException) { }
+            assertTrue(untruncated.calls.isEmpty()); assertArrayEquals(existing, untruncated.file.readBytes())
+        }
+        val empty = destination(ByteArray(0), size = 0, truncates = false)
+        repository.saveCopy(attachment.id, empty.uri)
+        assertTrue(empty.calls.isEmpty()); assertArrayEquals(bytes, empty.file.readBytes())
+        val unused = destination(ByteArray(0), size = 0, truncates = true)
+        repository.discardUnused(unused.uri)
+        assertEquals(listOf(DELETE_DOCUMENT), unused.calls)
+    }
+    @Test fun saveCancelledOrLockedWhileQueuedDiscardsThePickersDocument() = runBlocking {
+        repository.import(Note(title = "Save"), source("queued.txt", "Queued".toByteArray()))
+        val attachment = repository.attachments().values.single()
+        for (lock in listOf(false, true)) {
+            val target = destination(ByteArray(0), size = 0, truncates = true)
+            // Holds the mutex as indexing or a backup would.
+            val save = repository.mutex.withLock {
+                async(Dispatchers.IO, start = CoroutineStart.UNDISPATCHED) { repository.saveCopy(attachment.id, target.uri) }
+                    .also { if (lock) authorized = false else it.cancel() }
+            }
+            try { save.await(); fail("Queued save completed") } catch (_: CancellationException) { }
+            authorized = true
+            assertEquals(listOf(DELETE_DOCUMENT), target.calls)
+        }
     }
     @Test fun imageDecoderAppliesExifAndReleasesProxyDescriptors() = runBlocking {
         val picture = File(File(context.cacheDir, "camera").apply { mkdirs() }, "${newId()}.jpg").also { sources += it }
@@ -431,4 +496,31 @@ class StorageIntegrationTest {
             }
         }
     }
+}
+
+/** DocumentsContract's method name for deleteDocument. */
+private const val DELETE_DOCUMENT = "android:deleteDocument"
+
+/**
+ * A save destination as Android permits providers to behave: it may reject "wt", keep trailing bytes on "w",
+ * and report an unknown size as null. It records the methods called on it, such as [DELETE_DOCUMENT].
+ */
+private class SaveDestination(context: Context, val file: File, private val size: Long?, private val truncates: Boolean) : ContentProvider() {
+    val calls = mutableListOf<String>()
+    val uri: Uri = Uri.parse("content://dev.securenotes.test.saves/document")
+    init { attachInfo(context, ProviderInfo().apply { authority = uri.authority }) }
+    val resolver: ContentResolver = ContentResolver.wrap(this)
+    override fun onCreate() = true
+    override fun query(uri: Uri, projection: Array<out String>?, selection: String?, selectionArgs: Array<out String>?, sortOrder: String?): Cursor =
+        MatrixCursor(arrayOf(OpenableColumns.SIZE)).apply { addRow(arrayOf<Any?>(size)) }
+    override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
+        if (mode == "wt" && !truncates) throw java.io.FileNotFoundException("Unsupported mode $mode")
+        val truncate = if (mode == "wt") ParcelFileDescriptor.MODE_TRUNCATE else 0
+        return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_WRITE_ONLY or ParcelFileDescriptor.MODE_CREATE or truncate)
+    }
+    override fun call(method: String, arg: String?, extras: Bundle?): Bundle? { calls += method; return null }
+    override fun getType(uri: Uri): String? = null
+    override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+    override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?) = 0
+    override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?) = 0
 }

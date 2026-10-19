@@ -61,6 +61,12 @@ class Vault(val context: Context, val directory: File, root: ByteArray, val chec
 
     fun blob(id: String): File { require(validId(id)); return File(blobs, id) }
     fun read(id: String): InputStream { checkAccess(); return streaming.newDecryptingStream(blob(id).inputStream(), id.toByteArray()) }
+    /** Decrypts into [output], checking the session before every chunk. */
+    fun copy(id: String, output: OutputStream, checkpoint: () -> Unit = {}) = read(id).use { input ->
+        val buffer = ByteArray(64 * 1024)
+        try { while (true) { checkAccess(); checkpoint(); val count = input.read(buffer); if (count < 0) break; output.write(buffer, 0, count) } }
+        finally { buffer.fill(0) }
+    }
     fun write(id: String, input: InputStream, maxBytes: Long = Long.MAX_VALUE, checkpoint: () -> Unit = {}): Pair<Long, String> {
         require(validId(id))
         val temporary = File(blobs, "$id.part")

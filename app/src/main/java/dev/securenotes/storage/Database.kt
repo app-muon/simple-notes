@@ -22,6 +22,8 @@ data class AttachmentRow(
     @PrimaryKey val id: String, val noteId: String, val filename: String, val mime: String,
     val size: Long, val sha256: String, val indexed: Boolean = false, val nextPage: Int = 0,
 )
+/** Camera shots taken before captures were named after their time carry their capture file's name, `<id>.jpg`. */
+val AttachmentRow.displayName: String get() = if (filename == "$id.jpg") "Photo.jpg" else filename
 @Entity(tableName = "sources", indices = [Index("noteId"), Index("attachmentId")])
 data class SourceRow(@PrimaryKey val id: String, val noteId: String, val attachmentId: String?,
     val kind: String, val text: String, val offset: Int = 0)

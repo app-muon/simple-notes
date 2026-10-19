@@ -19,6 +19,7 @@ import dev.securenotes.ui.SecureNotesApp
 import dev.securenotes.ui.SharedContent
 import dev.securenotes.security.DeviceKeyUnavailableException
 import dev.securenotes.security.Passphrase
+import dev.securenotes.storage.AttachmentProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -70,7 +71,7 @@ class MainActivity : FragmentActivity() {
             }
         })
         if (savedInstanceState == null) receive(intent)
-        setContent { SecureNotesApp(model, ::authenticate, ::configureLock, ::openAttachment, ::recover, ::revealPassphrase) }
+        setContent { SecureNotesApp(model, ::authenticate, ::configureLock, ::openAttachment, ::recover, ::revealPassphrase, ::shareAttachment) }
     }
     override fun onResume() {
         super.onResume()
@@ -156,5 +157,18 @@ class MainActivity : FragmentActivity() {
             launchedExternal = true; externalWasPaused = false
             startActivity(view)
         } catch (_: Exception) { app.revokeGrants(); launchedExternal = false; model.error = "No installed application could open this attachment." }
+    }
+    /** Unlike opening, returning here keeps the grant: it ends when the phone locks. */
+    private fun shareAttachment(id: String) {
+        val attachment = model.attachments[id] ?: return
+        val uri = Uri.parse("content://$packageName.attachments/${AttachmentProvider.SHARED}/$id")
+        try {
+            app.checkAccess(); app.shareGrants.add(uri)
+            val send = Intent(Intent.ACTION_SEND).setType(attachment.mime).putExtra(Intent.EXTRA_STREAM, uri)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            send.clipData = android.content.ClipData.newRawUri("Attachment", uri)
+            // Notes accepts every type of share, but cannot import from its own provider.
+            startActivity(Intent.createChooser(send, null).putExtra(Intent.EXTRA_EXCLUDE_COMPONENTS, arrayOf(android.content.ComponentName(this, MainActivity::class.java))))
+        } catch (_: Exception) { model.error = "This attachment could not be shared." }
     }
 }

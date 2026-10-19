@@ -374,7 +374,7 @@ Viewer supports:
 -   pan when zoomed;
 -   return/back.
 
-Do not provide a dedicated "Save to Gallery" or export action.
+The viewer offers Share and Save to device (section 9.5).
 
 ### 9.3 File attachments
 
@@ -408,6 +408,29 @@ Implementation requirements:
 Note: Android cannot guarantee what a receiving third-party application
 does with content once legitimately granted access. The notes app must
 minimize the scope and duration of its own grant.
+
+### 9.5 Sharing and saving attachments
+
+Each attachment's menu, in both reading and editing modes, and the image
+viewer offer:
+
+-   **Share:** the Android share sheet for that one attachment, served
+    by the same content provider. No plaintext copy is written. The read
+    grant survives returning to the app, because some receiving apps
+    read only when they send or upload, and ends when the device locks.
+    The notes app itself is not offered as a destination.
+-   **Save to device:** the system save picker, suggesting the
+    attachment's name and type. The decrypted bytes are written only to
+    the document the user chose. Locking or cancelling stops the save,
+    including while it waits for another operation; a partial copy, or
+    the picker's unused empty document, is deleted. A document whose
+    size is unknown is never deleted unwritten. Replacing an existing
+    file never leaves its old trailing bytes: where the provider cannot
+    truncate, the save fails instead.
+
+Attachments leave byte-for-byte as stored, including image metadata
+such as location. Whole notes are still never shared or exported
+(section 12.3).
 
 ------------------------------------------------------------------------
 
@@ -590,6 +613,8 @@ For incoming images/files, import them into app-private storage.
 Do **not** provide an individual-note Share/Export feature.
 
 Notes should not have an app-provided "Share note" action.
+
+Individual attachments may be shared or saved (section 9.5).
 
 Normal Android clipboard behavior is allowed, so users may still
 manually copy text.
@@ -936,7 +961,6 @@ changed:
 -   Android system-wide note search
 -   Android automatic/cloud app backup
 -   Manual image resizing
--   Save-to-gallery from image viewer
 
 Do not add features simply because another notes application commonly
 has them.
@@ -1251,6 +1275,7 @@ The initial release is complete when all of the following are true:
 -   Android Share can create a new note or add content to an existing
     note.
 -   No outbound individual-note share/export feature exists.
+-   Individual attachments can be shared, or saved to a chosen location.
 -   Manual password-encrypted full backup works.
 -   Restore validates first and then replaces all current data
     transactionally.
@@ -1344,6 +1369,7 @@ This specification incorporates the chosen behavior:
 -   Dates remain plain text
 -   Full-screen zoomable image viewer
 -   Attachments open externally
+-   Share or save individual attachments
 -   Temporary attachment URI access
 -   No artificial attachment size limit
 -   No storage usage display

@@ -3,6 +3,7 @@ package dev.securenotes.storage
 import android.content.Context
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import androidx.room.withTransaction
 import dev.securenotes.document.*
@@ -240,12 +241,12 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
         v.dao.attachments().filter { it.id !in used }.forEach { a -> v.blob(a.id).delete(); v.dao.deleteAttachment(a.id) }
         v.blobs.listFiles()?.filter { it.name !in used }?.forEach { it.delete() }
     }
-    suspend fun import(note: Note, uri: Uri, mimeHint: String? = null, importId: String = newId()): Note = access { v ->
+    suspend fun import(note: Note, uri: Uri, mimeHint: String? = null, importId: String = newId(), name: String? = null): Note = access { v ->
         v.dao.attachment(importId)?.let { return@access checkNotNull(v.dao.note(it.noteId)).decode() }
         require(uri.scheme == "content")
         check(uri.authority != "${context.packageName}.attachments")
-        var filename = "Attachment"
-        context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+        var filename = name ?: "Attachment"
+        if (name == null) context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
             if (c.moveToFirst()) filename = c.getString(0)?.take(512)?.ifBlank { "Attachment" } ?: filename
         }
         val mime = context.contentResolver.getType(uri) ?: mimeHint ?: "application/octet-stream"
@@ -278,6 +279,36 @@ class NotesRepository(private val context: Context, private val checkAccess: () 
         refresh(v); return result
     }
     suspend fun attachments(): Map<String, AttachmentRow> = access { it.dao.attachments().associateBy { a -> a.id } }
+    /**
+     * Writes an attachment's plaintext to a document the user chose; the mutex keeps its blob from being collected
+     * meanwhile. A failure, including cancellation or lock while waiting for the mutex, deletes the partial copy,
+     * or the picker's unused empty document.
+     */
+    suspend fun saveCopy(id: String, destination: Uri) {
+        var opened = false
+        try {
+            access { v ->
+                val operation = currentCoroutineContext()
+                // "w" may leave a longer file's trailing bytes, so without truncation only an empty document is written.
+                val output = runCatching { context.contentResolver.openOutputStream(destination, "wt") }.getOrNull()
+                    ?: if (knownEmpty(destination)) context.contentResolver.openOutputStream(destination, "w") else throw java.io.IOException("Destination cannot be truncated")
+                checkNotNull(output).use { opened = true; v.copy(id, it) { operation.ensureActive() } }
+            }
+        } catch (e: Exception) {
+            withContext(NonCancellable + Dispatchers.IO) {
+                if (opened) runCatching { DocumentsContract.deleteDocument(context.contentResolver, destination) } else discardUnused(destination)
+            }
+            throw e
+        }
+    }
+    /** Deletes a document the save picker created but nothing was written to. An existing file the user chose, or one of unknown size, is kept. */
+    fun discardUnused(destination: Uri) {
+        runCatching { if (knownEmpty(destination)) DocumentsContract.deleteDocument(context.contentResolver, destination) }
+    }
+    /** Providers may report an unknown size as null, which a cursor reads as zero. */
+    private fun knownEmpty(destination: Uri) = runCatching {
+        context.contentResolver.query(destination, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { it.moveToFirst() && !it.isNull(0) && it.getLong(0) == 0L }
+    }.getOrNull() == true
     suspend fun search(query: String, filter: NoteFilter = NoteFilter()): List<SearchHit> = access { v ->
         val terms = SearchText.tokens(query).map { it.term }.distinct().take(20)
         if (terms.isEmpty()) return@access emptyList()

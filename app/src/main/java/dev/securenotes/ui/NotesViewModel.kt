@@ -13,6 +13,7 @@ import dev.securenotes.document.*
 import dev.securenotes.search.*
 import dev.securenotes.security.Passphrase
 import dev.securenotes.storage.AttachmentRow
+import dev.securenotes.storage.displayName
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
@@ -64,6 +65,8 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
     var share by mutableStateOf<SharedContent?>(null)
     var choosingDestination by mutableStateOf(false)
     var cameraRecovery by mutableStateOf(false)
+    /** The attachment the save picker was opened for; locking cancels the save. */
+    private var pendingSave: String? = null
     var listAnchor: String? = null
     var listOffset: Int = 0
     var historyRevision by mutableIntStateOf(0)
@@ -116,6 +119,7 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
                 history.clear(); historyRevision++; screen = Screen.LIST; editing = false
                 busy = null; passwordMode = null; restoreCount = null; setupWords = null; revealedWords = null; backupProviderWarning = null; restoreUri = null
                 backupSetupToken = null; reviewingBackup = false; newDraft = false; imageId = null; focusTitle = false; bodyFocus = null
+                pendingSave = null
             } else { keyUnavailable = false; reconcileTags(); reloadAttachments() }
         } }
         viewModelScope.launch { repository.passphraseConfirmed.collect { confirmed ->
@@ -123,8 +127,9 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
             if (confirmed == false) runCatching { setupWords = repository.passphrase().split(' ') }
         } }
     }
-    fun task(message: String?, failure: String, action: suspend () -> Unit) {
-        if (reviewingBackup) return
+    /** Returns null when the action is refused; the returned job may also finish without running it, after a lock. */
+    fun task(message: String?, failure: String, action: suspend () -> Unit): Job? {
+        if (reviewingBackup) return null
         val job = app.scope.launch { operationMutex.withLock {
             if (!app.unlocked.value) return@withLock
             activeOperation = currentCoroutineContext()[Job]
@@ -134,6 +139,7 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
             finally { indicator.cancel(); busy = null; activeOperation = null }
         } }
         operation = job; operations.add(job); job.invokeOnCompletion { operations.remove(job) }
+        return job
     }
     fun progress(message: String) { app.scope.launch { if (operation?.isActive == true && app.unlocked.value) busy = message } }
     fun cancelOperation() { activeOperation?.cancel(); busy = null }
@@ -278,6 +284,28 @@ class NotesViewModel(application: Application) : AndroidViewModel(application) {
             }
             reloadAttachments(); app.startIndexing()
         }
+    }
+    /** Opens the save picker with the attachment's name and type; [launch] takes that name and type. */
+    fun requestSave(id: String, launch: (Pair<String, String>) -> Unit) {
+        val attachment = attachments[id] ?: return
+        pendingSave = id
+        try { launch(attachment.displayName to attachment.mime) }
+        catch (_: Exception) { pendingSave = null; error = "No installed application can save files." }
+    }
+    fun saveAttachment(destination: Uri?) {
+        val id = pendingSave
+        pendingSave = null
+        if (destination == null) return
+        val discard = { app.scope.launch(Dispatchers.IO) { repository.discardUnused(destination) } }
+        if (id == null || !app.unlocked.value) { discard(); return }
+        var started = false
+        val job = task("Saving…", "The attachment could not be saved. Check the destination and available storage.") {
+            started = true
+            repository.saveCopy(id, destination)
+            android.widget.Toast.makeText(app, "Saved", android.widget.Toast.LENGTH_SHORT).show()
+        }
+        // Once started, saveCopy cleans up itself; a save cancelled or locked out while queued never reaches it.
+        if (job == null) discard() else job.invokeOnCompletion { if (!started) discard() }
     }
     fun receive(content: SharedContent) { share = content }
     fun prepareCamera(launch: (Uri) -> Unit) {

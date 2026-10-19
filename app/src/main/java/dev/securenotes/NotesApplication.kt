@@ -57,7 +57,11 @@ class NotesApplication : Application() {
         private set
     fun beginRecovery(root: ByteArray) { clearRecovery(); pendingRecovery = root }
     fun clearRecovery() { pendingRecovery?.fill(0); pendingRecovery = null }
+    /** Viewer grants end when the user returns to the app. */
     val grants: MutableSet<android.net.Uri> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+    /** Share grants last until the phone locks: a receiving app may read only when it sends, after the user has come back. */
+    val shareGrants: MutableSet<android.net.Uri> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+    fun granted(uri: android.net.Uri) = uri in grants || uri in shareGrants
     /** Saves that must finish even if the user leaves the app; [BackupKeepAlive] runs while this is above zero. */
     val keptAlive = MutableStateFlow(0)
     /**
@@ -155,7 +159,7 @@ class NotesApplication : Application() {
     fun lock() {
         if (!authorized) return
         sessionEpoch.incrementAndGet(); repository.freezeEdits()
-        authorized = false; unlocked.value = false; indexing?.cancel(); backupScheduler.onLocked(); revokeGrants()
+        authorized = false; unlocked.value = false; indexing?.cancel(); backupScheduler.onLocked(); revokeGrants(); revoke(shareGrants)
         closing = scope.launch { sessionMutex.withLock { repository.close() } }
     }
     fun flushEdits() { backupScheduler.onLeaving() }
@@ -166,5 +170,6 @@ class NotesApplication : Application() {
             try { while (unlocked.value && repository.indexNext()) { yield() } } catch (_: Exception) { /* Durable checkpoints retry after unlock/import. */ }
         }
     }
-    fun revokeGrants() { grants.forEach { revokeUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION) }; grants.clear() }
+    fun revokeGrants() = revoke(grants)
+    private fun revoke(uris: MutableSet<android.net.Uri>) { uris.forEach { revokeUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION) }; uris.clear() }
 }

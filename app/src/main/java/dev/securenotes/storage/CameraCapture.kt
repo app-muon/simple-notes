@@ -12,6 +12,9 @@ import java.io.File
 
 @Serializable private data class Capture(val id: String, val noteId: String)
 
+/** The camera writes the capture file when the shot is taken, so its modification time names the photo. */
+fun photoName(takenAt: Long): String = "Photo ${java.text.SimpleDateFormat("yyyy-MM-dd HH.mm.ss", java.util.Locale.ROOT).format(java.util.Date(takenAt))}.jpg"
+
 /** Destination lives in SQLCipher; only a non-sensitive completion flag is readable while locked. */
 class CameraCapture(private val context: Context, private val repository: NotesRepository) {
     private val directory = File(context.cacheDir, "camera").apply { mkdirs() }
@@ -52,7 +55,7 @@ class CameraCapture(private val context: Context, private val repository: NotesR
         if (success && initial != null) {
             check(file(capture).length() > 0) { "Camera returned no photo" }
             // Stable IDs make recovery safe if the process dies immediately after import commits.
-            updated = repository.import(initial, uri(capture), "image/jpeg", capture.id)
+            updated = repository.import(initial, uri(capture), "image/jpeg", capture.id, photoName(file(capture).lastModified()))
         } else if (initial?.isEmpty == true) repository.delete(initial.id)
         repository.access { it.dao.deleteSecret("pending-camera") }
         context.revokeUriPermission(uri(capture), Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
