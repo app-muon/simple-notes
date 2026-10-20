@@ -170,7 +170,7 @@ class AutoBackup(
             withContext(io) { report("verify-active"); requireGrant(checkNotNull(config.folder)); files.verify(config.slots[config.active]) }
             val tag = config.pairTag
             val recorded = tag?.let { settings.files(it) }
-            if (recorded != null) checkAttachments(config, recorded.values, ::report)
+            if (recorded != null) checkFiles(checkNotNull(config.folder), config.attachmentFolder, recorded.values, ::report)
             report("prepare")
             val prepared = if (tag == null) source.prepare(progress)
                 else prepareIncremental(config, tag, checkNotNull(recorded), force, progress, ::report) ?: return@withLock
@@ -214,24 +214,38 @@ class AutoBackup(
     }
 
     /**
-     * Confirms from one listing, without reading any, that every completed attachment file is present at its recorded
-     * size. Damage needs a second signal from the document itself; anything less leaves the files unverified.
+     * Confirms from one listing, without reading any, that restore would find every completed file of [recorded] in
+     * [directory] (see [BackupService.attachmentEntry]) as the recorded document, at its recorded size. Damage needs the
+     * document's own answer to agree; anything less leaves the files unverified.
      */
-    private suspend fun checkAttachments(config: BackupConfiguration, recorded: Collection<AttachmentFile>, report: (String) -> Unit) = withContext(io) {
+    private suspend fun checkFiles(grant: String, directory: BackupFolder?, recorded: Collection<AttachmentFile>, report: (String) -> Unit) = withContext(io) {
         val completed = recorded.filter { it.complete }
         if (completed.isEmpty()) return@withContext
         report("check-attachments")
-        val directory = config.attachmentFolder ?: throw BackupFailure(BackupProblem.INVALID_CONFIGURATION)
-        requireGrant(checkNotNull(config.folder))
-        val listed = files.children(directory.uri).associateBy { it.uri }
+        val folder = directory ?: throw BackupFailure(BackupProblem.INVALID_CONFIGURATION)
+        requireGrant(grant)
+        val listed = files.children(folder.uri).filter { !it.directory }
         for (file in completed) {
-            val child = listed[file.uri]
-            if (child != null && child.size == file.length) continue
-            if (child != null && child.size == null) throw BackupFailure(BackupProblem.IO)
-            val measured = try { files.measure(file.uri) }
-            catch (_: FileNotFoundException) { throw BackupFailure(if (child == null) BackupProblem.ATTACHMENT_DAMAGED else BackupProblem.IO) }
-            throw BackupFailure(if (child != null && measured != null && measured == child.size) BackupProblem.ATTACHMENT_DAMAGED else BackupProblem.IO)
+            val found = BackupService.attachmentEntry(listed, { it.name }, file.id, file.name) ?: unresolved(file, listed)
+            when {
+                // Restore would read another document; only a full check can tell whether it is a valid copy.
+                found.uri != file.uri -> throw BackupFailure(BackupProblem.IO)
+                found.size == file.length -> continue
+                found.size == null -> throw BackupFailure(BackupProblem.IO)
+            }
+            val measured = try { files.measure(file.uri) } catch (_: FileNotFoundException) { throw BackupFailure(BackupProblem.IO) }
+            throw BackupFailure(if (measured != null && measured == found.size) BackupProblem.ATTACHMENT_DAMAGED else BackupProblem.IO)
         }
+    }
+    /**
+     * Restore would not find [file]. That is damage only if the document agrees: opening it reports it missing and the
+     * listing omits it, or it reports the same unresolvable name the listing shows. Anything else is unverified.
+     */
+    private fun unresolved(file: AttachmentFile, listed: List<BackupChild>): Nothing {
+        val child = listed.firstOrNull { it.uri == file.uri }
+        try { files.measure(file.uri) }
+        catch (_: FileNotFoundException) { throw BackupFailure(if (child == null) BackupProblem.ATTACHMENT_DAMAGED else BackupProblem.IO) }
+        throw BackupFailure(if (child != null && files.displayName(file.uri) == child.name) BackupProblem.ATTACHMENT_DAMAGED else BackupProblem.IO)
     }
 
     /** Captures the content, saves each attachment without a completed file, and prepares the version-4 index. */
@@ -379,17 +393,14 @@ class AutoBackup(
         report("attachments")
         val directory = config.attachmentFolder ?: throw BackupFailure(BackupProblem.ATTACHMENT_DAMAGED)
         val recorded = settings.files(checkNotNull(config.pairTag))
+        val listed = withContext(io) { files.children(directory.uri) }.filter { !it.directory }
         named.values.forEachIndexed { index, (attachment, name, key) ->
             progress("Checking attachment ${index + 1} of ${named.size}")
             val file = recorded[attachment.id]?.takeIf { it.complete && it.name == name && it.size == attachment.size && it.sha256 == attachment.sha256 }
                 ?: throw BackupFailure(BackupProblem.ATTACHMENT_DAMAGED)
-            val intact = try { readChecked(file.uri) { source.checkAttachment(it, key, attachment); true } ?: false }
-            catch (e: FileNotFoundException) {
-                // Missing only if the folder's listing agrees; otherwise unverified.
-                if (withContext(io) { files.children(directory.uri) }.any { it.uri == file.uri }) throw e
-                false
-            }
-            if (!intact) throw BackupFailure(BackupProblem.ATTACHMENT_DAMAGED)
+            // Read what restore would read, which may be a provider's copy rather than the recorded document.
+            val found = BackupService.attachmentEntry(listed, { it.name }, attachment.id, name) ?: withContext(io) { unresolved(file, listed) }
+            if (readChecked(found.uri) { source.checkAttachment(it, key, attachment); true } == null) throw BackupFailure(BackupProblem.ATTACHMENT_DAMAGED)
         }
     }
     /** Null when the document was read in full but its content failed a check; read and access failures propagate. */
@@ -444,7 +455,10 @@ class AutoBackup(
             operation = null; publish(); mutex.unlock()
         }
     }
-    /** Continues an unfinished setup with current content, reusing every attachment file it completed. */
+    /**
+     * Continues an unfinished setup with current content, reusing every attachment file it completed. After a phrase
+     * change it starts afresh instead, with a new key and folder, once the new phrase has been reviewed.
+     */
     suspend fun resumeSetup(progress: (String) -> Unit = {}): BackupAdmission {
         val admission = admission()
         if (!admission.accepted) return rejectSetup(admission)
@@ -456,9 +470,15 @@ class AutoBackup(
             val pending = trusted?.setup ?: return BackupAdmission.INELIGIBLE
             val snapshot = source.capture(progress)
             if (snapshot.content.phraseHash != pending.phraseHash) {
-                // A restore changed the phrase since this setup began: continue only once it has been reviewed.
                 if (reviewedPhrase != snapshot.content.phraseHash) throw BackupFailure(BackupProblem.PHRASE_CHANGED)
-                persist(checkNotNull(trusted).copy(setup = pending.copy(phraseHash = snapshot.content.phraseHash)))
+                // An index written under the old phrase may already hold this setup's key, so nothing it encrypted is
+                // reused. Its files stay as history, like any old pair's; only its device records are forgotten.
+                report("restart-setup")
+                val fresh = PendingSetup(pending.folder, newId(), timestamp(), snapshot.content.phraseHash, pending.ownsGrant)
+                val key = Crypto.newStreamingKey()
+                try { record { begin -> settings.saveKey(fresh.pairTag, key, begin) } } finally { key.fill(0) }
+                persist(checkNotNull(trusted).copy(setup = fresh))
+                withContext(NonCancellable + io) { runCatching { settings.forget(pending.pairTag) } }
             }
             return completeSetup(snapshot, progress, report)
         } catch (e: CancellationException) { throw e }
@@ -528,6 +548,9 @@ class AutoBackup(
                 val known = checkNotNull(trusted).managedUris + saved.values.map { it.uri }
                 saved[attachment.id] = saveAttachment(tag, pending.folder, directory.uri, snapshot, attachment, saved[attachment.id], key, known, report)
             }
+            // Files completed by an earlier attempt may have gone since: check every file the indexes will name, as a
+            // routine save does, before either index is written. Failure leaves the previous pair active.
+            checkFiles(pending.folder, pending.attachmentFolder, snapshot.attachments.map { saved.getValue(it.id) }, report)
             report("prepare-index")
             return source.prepareIndex(snapshot, key, pending.attachmentFolder?.name, snapshot.attachments.associate { it.id to saved.getValue(it.id).name }).use { artifact ->
                 val slots = listOf("A", "B").mapIndexed { index, label ->

@@ -162,7 +162,7 @@ interface BackupSettingsStore {
     suspend fun forget(pairTag: String)
 }
 /** A direct child of a backup directory; [size] is null when the provider does not report one. */
-data class BackupChild(val uri: String, val name: String, val size: Long?)
+data class BackupChild(val uri: String, val name: String, val size: Long?, val directory: Boolean = false)
 data class BackupDocument(val uri: String, val name: String, val nameConfirmed: Boolean = true)
 interface BackupOutput : Closeable {
     val stream: OutputStream

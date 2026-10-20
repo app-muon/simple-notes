@@ -87,9 +87,11 @@ class AndroidBackupFiles(private val context: Context) : BackupFiles {
         (DocumentsContract.createDocument(resolver, parent(folder), DocumentsContract.Document.MIME_TYPE_DIR, name) ?: throw IOException()).toString()
     override fun children(directory: String): List<BackupChild> {
         val uri = directory.toUri()
-        val columns = arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME, DocumentsContract.Document.COLUMN_SIZE)
+        val columns = arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_SIZE, DocumentsContract.Document.COLUMN_MIME_TYPE)
         return resolver.query(DocumentsContract.buildChildDocumentsUriUsingTree(uri, DocumentsContract.getDocumentId(uri)), columns, null, null, null)?.use { c ->
-            buildList { while (c.moveToNext()) add(BackupChild(DocumentsContract.buildDocumentUriUsingTree(uri, c.getString(0)).toString(), c.getString(1) ?: "", if (c.isNull(2)) null else c.getLong(2))) }
+            buildList { while (c.moveToNext()) add(BackupChild(DocumentsContract.buildDocumentUriUsingTree(uri, c.getString(0)).toString(), c.getString(1) ?: "",
+                if (c.isNull(2)) null else c.getLong(2), c.getString(3) == DocumentsContract.Document.MIME_TYPE_DIR)) }
         } ?: throw IOException()
     }
     override fun measure(uri: String): Long? = (resolver.openFileDescriptor(uri.toUri(), "r") ?: throw IOException()).use { it.statSize.takeIf { size -> size >= 0 } }

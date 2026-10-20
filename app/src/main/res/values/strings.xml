@@ -7,7 +7,8 @@
     <string name="backup_resume_setup">Resume setup</string>
     <string name="backup_discard_setup">Discard setup</string>
     <string name="backup_setup_conflict">An attachment no longer matches the copy this unfinished setup saved, for example after restoring a different backup. Discard the setup and start again.</string>
-    <string name="backup_setup_phrase">The recovery phrase changed since this setup began. View and review the recovery phrase, then resume the setup.</string>
+    <string name="backup_setup_phrase">The recovery phrase changed since this setup began. View and review the recovery phrase, then resume: the setup starts again with the new phrase, and the files it already made are kept.</string>
+    <string name="backup_setup_damaged">A file this unfinished setup saved is missing or damaged, so it was not activated. Your current backup is unchanged. Discard the setup and start again.</string>
     <string name="backup_attachments_unverified">The backup\'s attachment files could not be checked, so their condition is unverified. No backup file was overwritten. Check access and retry with Back up now, or create a new pair if files are missing.</string>
     <string name="backup_attachments_access">The backup\'s attachment folder could not be accessed, so its files could not be checked. No backup file was overwritten. Check backup access in Settings and retry when access is available.</string>
     <string name="backup_attachment_damaged">An attachment file of this backup pair is missing or damaged. No backup file was overwritten. Create a new pair and keep the old files for recovery.</string>

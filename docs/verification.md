@@ -1,5 +1,18 @@
 # Verification
 
+## Attachment files review follow-up, 20 October 2026
+
+Fixed three review findings, plus a related gap in routine saves.
+
+1. **Phrase change during setup.** Resuming a setup after a restore changed the phrase used to keep its attachment key, which an index written under the old phrase might already contain. It now starts afresh with a new key, tag and folder once the phrase is reviewed, keeping the earlier files as history.
+2. **Missing files at activation.** A resumed setup trusted files completed in earlier attempts. It now runs a routine save's checks on every file the indexes will name before writing either index. A missing file leaves the previous pair active.
+3. **Verify and restore finding different files.** Verify backup opened recorded URIs, but restore resolves files by name. Verify now uses restore's rule and reads whatever that rule finds.
+4. **Routine saves had the same gap.** Some providers keep a URI across a rename, so a file renamed out of restore's reach still looked present. Saves now apply restore's rule too. A rename counts as damage only when the listing and the document's own name query agree.
+
+- Full JVM suite: **129 passed**. New tests cover a fresh key, folder and tag after a phrase change, with the earlier files kept. A file deleted between attempts blocks activation, and the current pair keeps saving. Name cases are covered for routine saves and Verify: collision-suffixed, renamed away, renamed in the listing only, another document holding the name, ambiguous candidates, and a valid or damaged copy where the recorded document is gone.
+- Debug APK and instrumentation APK: **built successfully**; one build first hit the intermittent Gradle "Failed to clean up output files" error and passed on retry. Lint: **0 errors, 10 warnings**. `git diff --check`: **passed**.
+- Storage and real-provider instrumentation: **38 passed, 1 expected skip** on the same disposable emulator configuration. UI tests were not rerun: the only UI changes are messages. Transcript: `%TEMP%/notes-review-fixes-focused.txt`.
+
 ## Attachment files, full checks and resumable setup, 19 October 2026
 
 New pairs keep only an index (manifest version 4) in their A/B files and save each attachment once as an encrypted `.ssna` file in a folder beside them. Routine saves list that folder instead of reading it; damage needs two independent signals. **Verify backup** reads both indexes and every attachment with restore's checks. Setup is resumable: an interrupted setup offers Resume and Discard while the current pair keeps saving, and **Upgrade backup** moves a whole-file pair to a new pair in the same folder. Restore asks for the attachment folder after authenticating the index. The device configuration moves to version 2; no Room schema change. Manifest versions 1–3 still restore.

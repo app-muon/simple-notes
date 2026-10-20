@@ -11,6 +11,7 @@ import dev.securenotes.backup.*
 
 internal fun backupErrorResource(error: BackupError, setup: Boolean = false): Int = when {
     setup && error.step == "attachment-identity" -> R.string.backup_setup_conflict
+    setup && error.step == "check-attachments" && error.problem == BackupProblem.ATTACHMENT_DAMAGED -> R.string.backup_setup_damaged
     setup && error.step == "resume" && error.problem == BackupProblem.PHRASE_CHANGED -> R.string.backup_setup_phrase
     setup && error.problem in setOf(BackupProblem.IO, BackupProblem.INVALID_CONFIGURATION, BackupProblem.ACTIVE_DAMAGED, BackupProblem.ATTACHMENT_DAMAGED) -> R.string.backup_setup_io
     setup && error.problem == BackupProblem.ACCESS -> R.string.backup_setup_access

@@ -261,7 +261,7 @@ class BackupService(private val context: Context, private val repository: NotesR
                 data.attachments.forEachIndexed { index, attachment ->
                     checkAccess(); operation.ensureActive()
                     progress("Validating attachment ${index + 1} of ${data.attachments.size}")
-                    val entry = attachmentEntry(entries, attachment.id, names.getValue(attachment.id)) ?: throw FileNotFoundException("Missing attachment")
+                    val entry = attachmentEntry(entries, { it.name }, attachment.id, names.getValue(attachment.id)) ?: throw FileNotFoundException("Missing attachment")
                     folder.open(entry).buffered().use { input ->
                         AttachmentCodec.decrypt(input, key, attachment.id) { clear ->
                             val (size, hash) = staged.write(attachment.id, clear, attachment.size) { operation.ensureActive() }
@@ -338,11 +338,14 @@ class BackupService(private val context: Context, private val repository: NotesR
         }
         /** A single path component a provider can show; names of one manifest must not collide ignoring case. */
         fun safeName(name: String) = name.isNotBlank() && name.length <= 255 && name != "." && name != ".." && name.none { it == '/' || it == '\\' || it == '\u0000' }
-        /** The mapped name must match exactly one file; failing that, one file whose name starts with the ID. */
-        fun attachmentEntry(entries: List<AttachmentFolder.Entry>, id: String, name: String): AttachmentFolder.Entry? {
-            val named = entries.filter { it.name == name }
+        /**
+         * How restore finds an attachment's file among a folder's files: the mapped name must match exactly one; failing
+         * that, one whose name starts with the ID. Saves and full checks use the same rule, so they look where restore will.
+         */
+        fun <T> attachmentEntry(files: List<T>, nameOf: (T) -> String, id: String, name: String): T? {
+            val named = files.filter { nameOf(it) == name }
             if (named.isNotEmpty()) return named.singleOrNull()
-            return entries.filter { it.name.startsWith(id) }.singleOrNull()
+            return files.filter { nameOf(it).startsWith(id) }.singleOrNull()
         }
         /** The serialized version-4 index for [content]; the size limit applies to all of it, including the new fields. */
         fun indexBytes(content: BackupManifest, key: ByteArray, folder: String?, files: Map<String, String>, revision: Long): ByteArray {

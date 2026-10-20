@@ -194,6 +194,10 @@ class BackupCoordinatorTest {
             return if (uri in measuredSizes) measuredSizes[uri] else bytes.size.toLong()
         }
         override fun displayName(uri: String): String? { nameFailure?.let { throw it }; return if (missingName) name else names[uri] }
+        /** A rename by the user or a sync app, on a provider that keeps the document's URI. */
+        fun rename(uri: String, name: String) { names[uri] = name }
+        /** Another document with the same content, such as a sync app's copy. */
+        fun copy(from: String, uri: String, name: String) { data[uri] = data.getValue(from).clone(); names[uri] = name }
         override fun delete(uri: String) {
             events += "delete:$uri"; data.remove(uri)
             if (directories.remove(uri)) data.keys.removeAll { it.startsWith("$uri/") }
@@ -1171,8 +1175,17 @@ class BackupCoordinatorTest {
         assertEquals(R.string.backup_setup_phrase, dev.securenotes.ui.backupErrorResource(g.backup.status.value!!.setupError!!, setup = true))
         assertTrue(g.backup.setupNeedsReview()); assertNotNull(g.settings.record.setup)
         g.backup.phraseReviewed(g.source.phrase)
+        // Nothing encrypted under the old phrase's setup is reused: a new key, tag and folder, with its files kept.
+        val earlier = checkNotNull(g.settings.record.setup)
+        val earlierFiles = g.settings.files.getValue(earlier.pairTag).values.map { it.uri } + earlier.created
+        val encrypted = g.source.encrypted.size
         assertEquals(BackupAdmission.ACCEPTED, g.backup.resumeSetup())
-        assertEquals(g.source.phrase, g.settings.record.phraseHash); assertNull(g.settings.record.error)
+        val fresh = g.settings.record
+        assertEquals(g.source.phrase, fresh.phraseHash); assertNull(fresh.error)
+        assertNotEquals(earlier.pairTag, fresh.pairTag); assertNotEquals(earlier.attachmentFolder, fresh.attachmentFolder)
+        assertEquals(listOf(id(1), id(2)), g.source.encrypted.drop(encrypted))
+        assertTrue(earlierFiles.all { it in g.files.data || it in g.files.directories })
+        assertFalse(earlier.pairTag in g.settings.keys); assertFalse(earlier.pairTag in g.settings.files)
 
         val h = interruptedSetup()
         h.source.attachments[id(1)] = "other".toByteArray(); h.source.revision++
@@ -1181,6 +1194,66 @@ class BackupCoordinatorTest {
         assertEquals(BackupProblem.ATTACHMENT_DAMAGED to "attachment-identity", conflict.problem to conflict.step)
         assertEquals(R.string.backup_setup_conflict, dev.securenotes.ui.backupErrorResource(conflict, setup = true))
         assertEquals(BackupAdmission.ACCEPTED, h.backup.discardSetup()); assertNull(h.settings.record.setup)
+    }
+    @Test fun `resume never activates a pair whose completed files have gone`() = runTest {
+        val f = interruptedSetup(); val old = f.settings.record; val pending = checkNotNull(old.setup)
+        val completed = f.settings.files.getValue(pending.pairTag).getValue(id(1))
+        // Unverified: nothing is activated, and a later attempt can still finish.
+        f.files.listFailure = IOException("provider")
+        assertEquals(BackupAdmission.FAILED, f.backup.resumeSetup())
+        assertEquals(BackupProblem.IO to "check-attachments", f.backup.status.value!!.setupError!!.let { it.problem to it.step })
+        assertEquals(old.pairTag, f.settings.record.pairTag); assertEquals(old.slots, f.settings.record.slots)
+        assertTrue(f.settings.record.setup!!.slots.isEmpty())
+        // Confirmed missing: the setup cannot finish; the current pair stays active and keeps saving.
+        f.files.listFailure = null; f.files.data.remove(completed.uri)
+        assertEquals(BackupAdmission.FAILED, f.backup.resumeSetup())
+        val damaged = f.backup.status.value!!.setupError!!
+        assertEquals(BackupProblem.ATTACHMENT_DAMAGED to "check-attachments", damaged.problem to damaged.step)
+        assertEquals(R.string.backup_setup_damaged, dev.securenotes.ui.backupErrorResource(damaged, setup = true))
+        assertEquals(old.pairTag, f.settings.record.pairTag); assertTrue(f.settings.record.setup!!.slots.isEmpty())
+        f.source.revision++; f.backup.run(); assertNull(f.settings.record.error); assertEquals(old.pairTag, f.settings.record.pairTag)
+        assertEquals(BackupAdmission.ACCEPTED, f.backup.discardSetup())
+    }
+    @Test fun `routine saves look for files where restore will`() = runTest {
+        val cases = listOf<Triple<String, BackupProblem?, (FakeFiles, AttachmentFile) -> Unit>>(
+            // A provider collision suffix still resolves by ID, as restore resolves it.
+            Triple("suffixed", null) { files, file -> files.rename(file.uri, "${file.id}.ssna (1)") },
+            Triple("renamed away", BackupProblem.ATTACHMENT_DAMAGED) { files, file -> files.rename(file.uri, "photo.ssna") },
+            // The listing alone reports the rename: unverified.
+            Triple("renamed in the listing only", BackupProblem.IO) { files, file -> files.rename(file.uri, "photo.ssna"); files.missingName = true; files.name = file.name },
+            // Restore would read another document; only a full check can tell whether it is a valid copy.
+            Triple("another document has the name", BackupProblem.IO) { files, file -> files.rename(file.uri, "photo.ssna"); files.copy(file.uri, "folder/1/copy", file.name) },
+            Triple("ambiguous", BackupProblem.ATTACHMENT_DAMAGED) { files, file ->
+                files.rename(file.uri, "${file.id} (1).ssna"); files.copy(file.uri, "folder/1/copy", "${file.id} (2).ssna")
+            },
+        )
+        for ((name, expected, arrange) in cases) {
+            val f = fixture(); f.source.attachments[id(1)] = "first".toByteArray(); f.setup()
+            arrange(f.files, f.saved().getValue(id(1)))
+            f.source.revision++; f.backup.run()
+            assertEquals(name, expected, f.settings.record.error?.problem)
+            if (expected != null) assertTrue(name, f.files.events.none { it.startsWith("open:") })
+        }
+    }
+    @Test fun `a full check reads what restore would read`() = runTest {
+        val cases = listOf<Triple<String, SlotCheck?, (FakeFiles, AttachmentFile) -> Unit>>(
+            Triple("suffixed", SlotCheck.VERIFIED) { files, file -> files.rename(file.uri, "${file.id}.ssna (1)") },
+            Triple("renamed away", null) { files, file -> files.rename(file.uri, "photo.ssna") },
+            // The recorded document is gone, but restore would find a valid copy under the suffixed name.
+            Triple("valid copy only", SlotCheck.VERIFIED) { files, file -> files.copy(file.uri, "folder/1/copy", "${file.id}.ssna (1)"); files.data.remove(file.uri) },
+            // Restore would read a copy whose content does not authenticate.
+            Triple("damaged copy only", null) { files, file -> files.copy(file.uri, "folder/1/copy", "${file.id}.ssna (1)"); files.data["folder/1/copy"] = "junk".toByteArray(); files.data.remove(file.uri) },
+        )
+        for ((name, expected, arrange) in cases) {
+            val f = fixture(); f.source.attachments[id(1)] = "first".toByteArray(); f.setup()
+            arrange(f.files, f.saved().getValue(id(1)))
+            f.backup.verify()
+            if (expected == null) {
+                assertEquals(name, BackupProblem.ATTACHMENT_DAMAGED, f.settings.record.error?.problem); assertNull(name, f.settings.record.check)
+            } else {
+                assertEquals(name, listOf(expected, expected), f.settings.record.check?.slots); assertNull(name, f.settings.record.error)
+            }
+        }
     }
     @Test fun `an uncertain setup commit blocks both configurations until restart`() = runTest {
         val f = interruptedSetup()
