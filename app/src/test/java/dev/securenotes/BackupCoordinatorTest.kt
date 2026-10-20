@@ -163,6 +163,8 @@ class BackupCoordinatorTest {
         /** Documents that open but fail partway through reading, and listed documents that report not found on opening. */
         val unreadable = mutableSetOf<String>()
         val unopenable = mutableSetOf<String>()
+        /** Stale listing entries for documents that no longer exist. */
+        val phantoms = mutableListOf<BackupChild>()
         private val names = mutableMapOf<String, String>()
         override fun hasGrant(folder: String): Boolean { grantChecks++; onGrant(); return folder in grants }
         override fun retain(folder: String) { grants += folder; events += "retain:$folder" }
@@ -185,7 +187,8 @@ class BackupCoordinatorTest {
             events += "list:$directory"
             listFailure?.let { throw it }
             return data.keys.filter { it.startsWith("$directory/") && '/' !in it.removePrefix("$directory/") && it !in hidden }
-                .map { BackupChild(it, names[it] ?: "", if (it in listedSizes) listedSizes[it] else data.getValue(it).size.toLong()) }
+                .map { BackupChild(it, names[it] ?: "", if (it in listedSizes) listedSizes[it] else data.getValue(it).size.toLong()) } +
+                phantoms.filter { it.uri.startsWith("$directory/") }
         }
         override fun measure(uri: String): Long? {
             events += "measure:$uri"
@@ -1226,6 +1229,17 @@ class BackupCoordinatorTest {
             Triple("ambiguous", BackupProblem.ATTACHMENT_DAMAGED) { files, file ->
                 files.rename(file.uri, "${file.id} (1).ssna"); files.copy(file.uri, "folder/1/copy", "${file.id} (2).ssna")
             },
+            // The competing entries come from the listing alone until each document confirms its own name.
+            Triple("stale duplicate of an ID-prefixed name", BackupProblem.IO) { files, file ->
+                files.rename(file.uri, "${file.id} (1).ssna"); files.phantoms += BackupChild("folder/1/gone", "${file.id} (2).ssna", 5)
+            },
+            Triple("stale duplicate of the exact name", BackupProblem.IO) { files, file -> files.phantoms += BackupChild("folder/1/gone", file.name, 5) },
+            Triple("duplicate whose own name disagrees", BackupProblem.IO) { files, file ->
+                files.rename(file.uri, "${file.id} (1).ssna"); files.copy(file.uri, "folder/1/copy", "other.ssna"); files.phantoms += BackupChild("folder/1/copy", "${file.id} (2).ssna", 5)
+            },
+            Triple("confirmed duplicates of the exact name", BackupProblem.ATTACHMENT_DAMAGED) { files, file ->
+                files.copy(file.uri, "folder/1/copy", file.name)
+            },
         )
         for ((name, expected, arrange) in cases) {
             val f = fixture(); f.source.attachments[id(1)] = "first".toByteArray(); f.setup()
@@ -1233,6 +1247,8 @@ class BackupCoordinatorTest {
             f.source.revision++; f.backup.run()
             assertEquals(name, expected, f.settings.record.error?.problem)
             if (expected != null) assertTrue(name, f.files.events.none { it.startsWith("open:") })
+            // A stale listing pauses nothing: once it recovers, the next save goes through.
+            if (name.startsWith("stale")) { f.files.phantoms.clear(); f.backup.run(); assertNull(name, f.settings.record.error) }
         }
     }
     @Test fun `a full check reads what restore would read`() = runTest {

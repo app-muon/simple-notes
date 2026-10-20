@@ -238,15 +238,27 @@ class AutoBackup(
         }
     }
     /**
-     * Restore would not find [file]. That is damage only if the document agrees: opening it reports it missing and the
-     * listing omits it, or it reports the same unresolvable name the listing shows. Anything else is unverified.
+     * Restore would not find [file]. That is damage only if documents confirm it, not the listing alone: opening the
+     * recorded document reports it missing and the listing omits it, or it reports the listed name itself and restore
+     * could not reach that name. When the name could resolve and only other entries stand in the way, each of those
+     * must also exist under its listed name; a stale duplicate must not pause a healthy pair. Anything else is unverified.
      */
     private fun unresolved(file: AttachmentFile, listed: List<BackupChild>): Nothing {
         val child = listed.firstOrNull { it.uri == file.uri }
         try { files.measure(file.uri) }
         catch (_: FileNotFoundException) { throw BackupFailure(if (child == null) BackupProblem.ATTACHMENT_DAMAGED else BackupProblem.IO) }
-        throw BackupFailure(if (child != null && files.displayName(file.uri) == child.name) BackupProblem.ATTACHMENT_DAMAGED else BackupProblem.IO)
+        if (child == null || files.displayName(file.uri) != child.name) throw BackupFailure(BackupProblem.IO)
+        if (child.name == file.name || child.name.startsWith(file.id)) {
+            // The entries restore ranks at or above this one under its rule: exact names first, otherwise ID prefixes.
+            val exact = listed.filter { it.name == file.name }
+            val rivals = (if (exact.isNotEmpty()) exact else listed.filter { it.name.startsWith(file.id) }) - child
+            if (rivals.isEmpty() || !rivals.all(::confirmed)) throw BackupFailure(BackupProblem.IO)
+        }
+        throw BackupFailure(BackupProblem.ATTACHMENT_DAMAGED)
     }
+    /** The document exists and reports the name its listing entry shows. */
+    private fun confirmed(entry: BackupChild): Boolean =
+        try { files.measure(entry.uri); files.displayName(entry.uri) == entry.name } catch (_: FileNotFoundException) { false }
 
     /** Captures the content, saves each attachment without a completed file, and prepares the version-4 index. */
     private suspend fun prepareIncremental(config: BackupConfiguration, tag: String, recorded: Map<String, AttachmentFile>, force: Boolean,
